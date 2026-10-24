@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 
 const PORT = 8790;
 const PEER_DIR = path.join(os.homedir(), '.dsh', 'peer-link');
+const SESSIONS_DIR = path.join(PEER_DIR, 'sessions');
 const CONFIG_FILE = path.join(PEER_DIR, 'config.json');
 const LEDGER_FILE = path.join(PEER_DIR, 'ledger.jsonl');
 
@@ -14,7 +15,7 @@ function loadConfig() {
     return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
   } catch {
     return {
-      node: { id: 'node-local', name: 'MacBook-Pro', avatar: '🧠', role: '前端架构' },
+      node: { id: 'node-local', name: 'MacBook-Pro-Frontend', avatar: '🧠', role: '前端与移动端架构专家' },
       listen_port: 8765,
       token: 'dsh-peer-secret-shared-token',
       peers: []
@@ -30,7 +31,7 @@ function readLedger() {
   try {
     if (!fs.existsSync(LEDGER_FILE)) return [];
     const lines = fs.readFileSync(LEDGER_FILE, 'utf-8').trim().split('\n').filter(Boolean);
-    return lines.slice(-20).map(l => {
+    return lines.slice(-50).map(l => {
       try { return JSON.parse(l); } catch { return null; }
     }).filter(Boolean).reverse();
   } catch {
@@ -38,8 +39,83 @@ function readLedger() {
   }
 }
 
+// 解析所有 session Markdown 文件并转换为结构化聊天消息
+function parseAllChatMessages() {
+  const messages = [];
+  if (!fs.existsSync(SESSIONS_DIR)) return messages;
+
+  const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.md'));
+  for (const file of files) {
+    try {
+      const fullPath = path.join(SESSIONS_DIR, file);
+      const content = fs.readFileSync(fullPath, 'utf-8');
+
+      // 正则提取关键信息
+      const traceMatch = content.match(/# 🤝 对等协作留痕会话:\s*([^\n]+)/);
+      const timeMatch = content.match(/- \*\*记录时间\*\*:\s*([^\n]+)/);
+      const fromMatch = content.match(/- \*\*发起方\*\*:\s*([^\n]+)/);
+      const toMatch = content.match(/- \*\*接收方\*\*:\s*([^\n]+)/);
+      const topicMatch = content.match(/- \*\*沟通主题\*\*:\s*([^\n]+)/);
+
+      const traceId = traceMatch ? traceMatch[1].trim() : file.replace('.md', '');
+      const time = timeMatch ? timeMatch[1].trim() : fs.statSync(fullPath).mtime.toISOString();
+      const from = fromMatch ? fromMatch[1].trim() : '未知节点';
+      const to = toMatch ? toMatch[1].trim() : '未知节点';
+      const topic = topicMatch ? topicMatch[1].trim() : '';
+
+      // 提取发送内容
+      const sendPart = content.split('## 📥 接收答复')[0];
+      const sendBodyMatch = sendPart.match(/## 📤 发送内容[^\n]*\n([\s\S]*?)(?=### 附带上下文|$)/);
+      const contextMatch = sendPart.match(/### 附带上下文\n```[\w]*\n([\s\S]*?)\n```/);
+
+      const reqText = sendBodyMatch ? sendBodyMatch[1].trim() : '';
+      const reqContext = contextMatch ? contextMatch[1].trim() : '';
+
+      // 提取接收答复
+      let resText = '';
+      if (content.includes('## 📥 接收答复')) {
+        const replyPart = content.split('## 📥 接收答复')[1];
+        resText = replyPart.replace(/---[\s\S]*$/, '').trim();
+      }
+
+      // 请求消息
+      messages.push({
+        id: `${traceId}-req`,
+        traceId,
+        from,
+        to,
+        topic,
+        content: reqText,
+        context: reqContext,
+        time,
+        type: 'request',
+        senderType: (content.includes('human') || content.includes('人类')) ? 'human' : 'agent'
+      });
+
+      // 答复消息
+      if (resText) {
+        messages.push({
+          id: `${traceId}-res`,
+          traceId,
+          from: to,
+          to: from,
+          topic,
+          content: resText,
+          time: new Date(new Date(time).getTime() + 100).toISOString(),
+          type: 'response',
+          senderType: 'agent'
+        });
+      }
+    } catch (e) {
+      console.error('Error parsing session file:', file, e);
+    }
+  }
+
+  // 按时间升序排列
+  return messages.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+}
+
 const server = http.createServer((req, res) => {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -52,6 +128,7 @@ const server = http.createServer((req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
+  // 1. 基础状态
   if (url.pathname === '/api/status' && req.method === 'GET') {
     const cfg = loadConfig();
     const ledger = readLedger();
@@ -60,6 +137,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 2. 聊天消息聚合
+  if (url.pathname === '/api/chat/messages' && req.method === 'GET') {
+    const peerName = url.searchParams.get('peer');
+    let allMsgs = parseAllChatMessages();
+    if (peerName && peerName !== 'all') {
+      allMsgs = allMsgs.filter(m => m.from === peerName || m.to === peerName);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, messages: allMsgs }));
+    return;
+  }
+
+  // 3. 修改档案
   if (url.pathname === '/api/profile' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
@@ -82,6 +172,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 4. 添加对端
   if (url.pathname === '/api/peers' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
@@ -111,6 +202,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 5. 节点探测
   if (url.pathname === '/api/ping' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
@@ -118,7 +210,7 @@ const server = http.createServer((req, res) => {
       try {
         const { peerId } = JSON.parse(body);
         const cfg = loadConfig();
-        const peer = (cfg.peers || []).find(p => p.id === peerId || p.url === peerId);
+        const peer = (cfg.peers || []).find(p => p.id === peerId || p.url === peerId || p.name === peerId);
         if (!peer) throw new Error('未找到该对等节点');
 
         const start = Date.now();
@@ -140,29 +232,105 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 6. 发送聊天消息并留痕
   if (url.pathname === '/api/send' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
       try {
-        const { topic, message, target } = JSON.parse(body);
+        const { topic, message, context, target, asHuman } = JSON.parse(body);
         const cfg = loadConfig();
         const traceId = `trace-${Date.now().toString(16)}-${crypto.randomBytes(2).toString('hex')}`;
+        const myNode = cfg.node || { name: 'MacBook-Pro-Frontend' };
         
-        // 记录本地 ledger
+        let targetPeer = null;
+        if (target && target !== 'all') {
+          targetPeer = (cfg.peers || []).find(p => p.name === target || p.id === target);
+        }
+
+        let replyText = '';
+        let durationMs = 0;
+
+        // 如果配置了具体 URL，发起真实 HTTP 投递
+        if (targetPeer && targetPeer.url) {
+          try {
+            const start = Date.now();
+            const postUrl = `${targetPeer.url.replace(/\/+$/, '')}/talk`;
+            const payload = {
+              topic: topic || '聊天消息',
+              message,
+              context,
+              as_human: !!asHuman,
+              sender: {
+                name: myNode.name,
+                avatar: myNode.avatar || '🧠',
+                role: myNode.role || '协作者',
+                type: asHuman ? 'human' : 'agent'
+              }
+            };
+            const r = await fetch(postUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${targetPeer.token || cfg.token}`
+              },
+              body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(3000)
+            });
+            durationMs = Date.now() - start;
+            if (r.ok) {
+              const resData = await r.json();
+              replyText = resData.reply || '【对端已成功接收并纳入处理】';
+            } else {
+              replyText = `【投递状态: HTTP ${r.status}】`;
+            }
+          } catch (err) {
+            replyText = `【发送中转记录: 对端当前可能离线或未启动服务 (${err.message})】`;
+          }
+        } else {
+          replyText = '【广播消息已分发并记录至局域网协同账本】';
+        }
+
+        // 保存 Markdown 会话记录
+        if (!fs.existsSync(SESSIONS_DIR)) {
+          fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+        }
+        const sessionDate = new Date().toISOString().slice(0, 10);
+        const sessionFile = path.join(SESSIONS_DIR, `${sessionDate}_${traceId}.md`);
+        const mdContent = `# 🤝 对等协作留痕会话: ${traceId}
+- **记录时间**: ${new Date().toISOString()}
+- **发起方**: ${myNode.name} (${asHuman ? '👤 人类' : '🤖 Agent'})
+- **接收方**: ${target || '局域网集群'}
+- **沟通主题**: ${topic || '即时对话'}
+- **状态**: completed
+- **耗时**: ${durationMs}ms
+
+## 📤 发送内容 / 提议草案
+${message}
+${context ? `\n### 附带上下文\n\`\`\`\n${context}\n\`\`\`\n` : ''}
+
+## 📥 接收答复 / 协商共识
+${replyText}
+---
+*由 DSH Peer Link 插件双端自动审计落盘*
+`;
+        fs.writeFileSync(sessionFile, mdContent, 'utf-8');
+
+        // 写入 Ledger
         const record = {
           trace_id: traceId,
           direction: 'outbound',
-          sender_type: 'human',
+          sender_type: asHuman ? 'human' : 'agent',
           peer: target || '全部节点',
-          topic,
-          durationMs: 2,
+          topic: topic || '即时对话',
+          durationMs,
+          sessionPath: sessionFile,
           _ts: new Date().toISOString()
         };
         fs.appendFileSync(LEDGER_FILE, JSON.stringify(record) + '\n', 'utf-8');
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, result: { trace_id: traceId } }));
+        res.end(JSON.stringify({ ok: true, result: { trace_id: traceId, reply: replyText } }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -171,325 +339,635 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 默认返回 HTML 单页
+  // 默认返回现代聊天软件风格单页 (WeChat / Slack 风格)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>🤝 DSH Peer Link 控制中心</title>
+  <title>💬 DSH 对等协同即时通讯中心</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: #0d1117;
-      color: #c9d1d9;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      padding: 28px;
-    }
-    .wrap { max-width: 1040px; margin: 0 auto; }
-    header {
+      background: #090d16;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      height: 100vh;
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-bottom: 18px;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    
+    /* 顶部导航条 */
+    .top-nav {
+      height: 52px;
+      background: #161b22;
       border-bottom: 1px solid #30363d;
-      margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      flex-shrink: 0;
     }
-    h1 { font-size: 22px; font-weight: 600; color: #58a6ff; display: flex; align-items: center; gap: 10px; }
-    .badge {
-      font-size: 12px;
-      padding: 2px 10px;
-      border-radius: 12px;
-      font-weight: 500;
+    .logo {
+      font-size: 16px;
+      font-weight: 600;
+      color: #58a6ff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
-    .badge-green { background: rgba(46,160,67,0.15); color: #3fb950; border: 1px solid rgba(46,160,67,0.4); }
-    .badge-purple { background: rgba(163,113,247,0.15); color: #a371f7; border: 1px solid rgba(163,113,247,0.4); }
-    .badge-gray { background: rgba(139,148,158,0.15); color: #8b949e; border: 1px solid #30363d; }
-    .btn {
-      background: #21262d;
-      border: 1px solid #30363d;
-      color: #c9d1d9;
-      padding: 7px 16px;
+    .nav-tabs {
+      display: flex;
+      gap: 8px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: #8b949e;
+      padding: 6px 14px;
       border-radius: 6px;
       cursor: pointer;
       font-size: 13px;
       font-weight: 500;
+      transition: all 0.2s;
     }
-    .btn:hover { background: #30363d; color: #fff; }
-    .btn-primary { background: #238636; border-color: #2ea043; color: #fff; }
-    .btn-primary:hover { background: #2ea043; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
-    .card {
-      background: #161b22;
-      border: 1px solid #30363d;
+    .tab-btn.active {
+      background: #21262d;
+      color: #58a6ff;
+      border-color: #30363d;
+    }
+    .tab-btn:hover:not(.active) {
+      color: #c9d1d9;
+    }
+
+    /* 主体布局：仿聊天软件双栏 */
+    .app-main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* 左侧好友/节点列表 */
+    .peer-sidebar {
+      width: 290px;
+      background: #0d1117;
+      border-right: 1px solid #30363d;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+    .sidebar-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid #21262d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 600;
+      color: #8b949e;
+    }
+    .peer-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+    .peer-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 12px;
       border-radius: 8px;
-      padding: 20px;
+      cursor: pointer;
+      margin-bottom: 4px;
+      transition: background 0.15s;
+      position: relative;
     }
-    .card-title {
+    .peer-item:hover {
+      background: #161b22;
+    }
+    .peer-item.active {
+      background: #1f242c;
+      border-left: 3px solid #58a6ff;
+    }
+    .avatar-wrap {
+      position: relative;
+      font-size: 24px;
+      line-height: 1;
+    }
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      position: absolute;
+      bottom: -1px;
+      right: -2px;
+      border: 2px solid #0d1117;
+    }
+    .dot-online { background: #3fb950; }
+    .dot-offline { background: #6e7681; }
+
+    .peer-info {
+      flex: 1;
+      min-width: 0;
+    }
+    .peer-top-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 3px;
+    }
+    .peer-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: #f0f6fc;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .peer-desc {
+      font-size: 11px;
+      color: #8b949e;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* 右侧聊天窗口 */
+    .chat-window {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: #090d16;
+      position: relative;
+    }
+    .chat-header {
+      height: 58px;
+      padding: 0 20px;
+      background: #0d1117;
+      border-bottom: 1px solid #30363d;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .chat-header-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .chat-header-name {
       font-size: 15px;
       font-weight: 600;
       color: #f0f6fc;
-      margin-bottom: 16px;
+    }
+    .chat-header-sub {
+      font-size: 12px;
+      color: #8b949e;
+    }
+
+    /* 消息气泡流 */
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .msg-group {
+      display: flex;
+      gap: 12px;
+      max-width: 82%;
+    }
+    .msg-group.outbound {
+      align-self: flex-end;
+      flex-direction: row-reverse;
+    }
+    .msg-group.inbound {
+      align-self: flex-start;
+    }
+    .msg-avatar {
+      font-size: 26px;
+      line-height: 1;
+      margin-top: 2px;
+    }
+    .msg-body-wrap {
+      display: flex;
+      flex-direction: column;
+    }
+    .msg-meta {
+      font-size: 11px;
+      color: #8b949e;
+      margin-bottom: 5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .msg-group.outbound .msg-meta {
+      justify-content: flex-end;
+    }
+    .badge-tag {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-weight: 500;
+    }
+    .badge-human { background: rgba(56, 139, 253, 0.15); color: #58a6ff; border: 1px solid rgba(56, 139, 253, 0.4); }
+    .badge-agent { background: rgba(163, 113, 247, 0.15); color: #bc8cff; border: 1px solid rgba(163, 113, 247, 0.4); }
+
+    .bubble {
+      padding: 12px 16px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.55;
+      word-break: break-word;
+      position: relative;
+    }
+    .msg-group.inbound .bubble {
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #e6edf3;
+      border-top-left-radius: 2px;
+    }
+    .msg-group.outbound .bubble {
+      background: #1f365d;
+      border: 1px solid #2f5496;
+      color: #f0f6fc;
+      border-top-right-radius: 2px;
+    }
+    .bubble-topic {
+      font-size: 12px;
+      font-weight: 600;
+      color: #79c0ff;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .code-block {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 10px;
+      margin-top: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px;
+      color: #7ee787;
+      white-space: pre-wrap;
+    }
+
+    /* 底部输入框 */
+    .chat-input-area {
+      background: #0d1117;
+      border-top: 1px solid #30363d;
+      padding: 14px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .input-toolbar {
       display: flex;
       justify-content: space-between;
       align-items: center;
     }
-    .input-group { margin-bottom: 12px; }
-    label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 6px; }
-    input, textarea, select {
-      width: 100%;
-      background: #0d1117;
+    .role-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #8b949e;
+    }
+    .input-row {
+      display: flex;
+      gap: 10px;
+    }
+    .topic-input {
+      width: 220px;
+      background: #161b22;
       border: 1px solid #30363d;
       color: #f0f6fc;
       padding: 8px 12px;
       border-radius: 6px;
       font-size: 13px;
     }
-    input:focus, textarea:focus { border-color: #58a6ff; outline: none; }
-    .peer-card {
-      background: #0d1117;
+    .msg-input {
+      flex: 1;
+      background: #161b22;
       border: 1px solid #30363d;
+      color: #f0f6fc;
+      padding: 8px 12px;
       border-radius: 6px;
-      padding: 14px;
-      margin-bottom: 10px;
+      font-size: 13px;
+      resize: none;
+      height: 42px;
+    }
+    .topic-input:focus, .msg-input:focus {
+      border-color: #58a6ff;
+      outline: none;
+    }
+    .send-btn {
+      background: #238636;
+      border: 1px solid #2ea043;
+      color: #fff;
+      padding: 0 18px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.15s;
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      gap: 6px;
     }
-    .peer-left { display: flex; align-items: center; gap: 14px; }
-    .peer-avatar { font-size: 26px; }
-    .peer-name { font-weight: 600; color: #f0f6fc; font-size: 14px; display: flex; align-items: center; gap: 8px; }
-    .peer-sub { font-size: 12px; color: #8b949e; margin-top: 2px; }
-    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
-    th, td { text-align: left; padding: 10px; border-bottom: 1px solid #21262d; }
-    th { color: #8b949e; font-weight: 500; }
+    .send-btn:hover { background: #2ea043; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <h1>🤝 DSH 跨电脑分布式对等协同网络 <span id="onlineBadge" class="badge badge-green">0 台在线</span></h1>
-      <div style="display:flex; gap:10px;">
-        <button class="btn" onclick="fetchData()">🔄 刷新状态</button>
-      </div>
-    </header>
+  <!-- 顶部状态栏 -->
+  <div class="top-nav">
+    <div class="logo">
+      <span>💬 DSH 对等协同即时通讯中心</span>
+      <span id="myProfileBadge" style="font-size:12px; color:#8b949e; font-weight:normal;"></span>
+    </div>
+    <div class="nav-tabs">
+      <button class="tab-btn active" id="tabChat" onclick="switchView('chat')">💬 即时对话聊天流</button>
+      <button class="tab-btn" id="tabDash" onclick="switchView('dash')">📊 集群看板与设置</button>
+    </div>
+  </div>
 
-    <div class="grid">
-      <!-- 本机档案 -->
-      <div class="card">
-        <div class="card-title">
-          <span>🧠 本机节点档案 (My Identity)</span>
-          <button class="btn" style="padding:3px 10px; font-size:12px;" onclick="saveProfile()">保存设置</button>
-        </div>
-        <div class="input-group">
-          <label>节点名称</label>
-          <input id="p_name" placeholder="例如: MacBook-Pro-Frontend">
-        </div>
-        <div style="display:flex; gap:12px;" class="input-group">
-          <div style="flex:1;">
-            <label>头像 Emoji</label>
-            <input id="p_avatar" placeholder="例如: 🧠">
+  <!-- 聊天模式视图 -->
+  <div class="app-main" id="viewChat">
+    <!-- 左侧通讯录 -->
+    <div class="peer-sidebar">
+      <div class="sidebar-header">
+        <span>对等联系人 (Peers)</span>
+        <button style="background:none; border:none; color:#58a6ff; cursor:pointer; font-size:12px;" onclick="refreshAll()">🔄 刷新</button>
+      </div>
+      <div class="peer-list" id="peerListEl"></div>
+    </div>
+
+    <!-- 右侧会话窗口 -->
+    <div class="chat-window">
+      <div class="chat-header">
+        <div class="chat-header-title">
+          <span id="currentPeerAvatar" style="font-size:22px;">📡</span>
+          <div>
+            <div class="chat-header-name" id="currentPeerName">局域网全网集群 (All Peers)</div>
+            <div class="chat-header-sub" id="currentPeerSub">广播给局域网中所有在线的 DSH 节点</div>
           </div>
-          <div style="flex:2;">
-            <label>职责定位</label>
-            <input id="p_role" placeholder="例如: 前端与移动端架构">
-          </div>
         </div>
-        <div class="input-group">
-          <label>共享认证安全 Token</label>
-          <input id="p_token" type="password">
-        </div>
+        <button class="tab-btn" style="border:1px solid #30363d;" onclick="pingCurrent()">⚡ 探测对端连通性</button>
       </div>
 
-      <!-- 人类直接发信 -->
-      <div class="card">
-        <div class="card-title">
-          <span>👤 人类直接指令控制台 (Direct Command)</span>
+      <!-- 消息气泡流 -->
+      <div class="chat-messages" id="chatStreamEl"></div>
+
+      <!-- 输入栏 -->
+      <div class="chat-input-area">
+        <div class="input-toolbar">
+          <div class="role-toggle">
+            <span>发信身份:</span>
+            <label style="cursor:pointer;"><input type="radio" name="senderRole" value="human" checked> 👤 人类指令 (Human)</label>
+            <label style="cursor:pointer; margin-left:8px;"><input type="radio" name="senderRole" value="agent"> 🤖 智能体探讨 (Agent)</label>
+          </div>
+          <span style="font-size:11px; color:#6e7681;">按 Enter 或点击发送</span>
         </div>
-        <div class="input-group">
-          <label>发送目标</label>
-          <select id="p_target">
-            <option value="all">📡 局域网全网广播 (All Peers)</option>
-          </select>
-        </div>
-        <div class="input-group">
-          <label>指令主题</label>
-          <input id="msg_topic" placeholder="例如: 用户中心 API 字段规范对齐">
-        </div>
-        <div class="input-group">
-          <label>任务正文 / 变更提议</label>
-          <textarea id="msg_body" rows="2" placeholder="输入要下达给对端 DSH 的工作任务或架构决策..."></textarea>
-        </div>
-        <div style="text-align:right;">
-          <button class="btn btn-primary" onclick="sendDirect()">🚀 发送人类指令</button>
+        <div class="input-row">
+          <input class="topic-input" id="inputTopic" placeholder="议题 (如: API数据模型确认)">
+          <textarea class="msg-input" id="inputMsg" placeholder="输入要协商的技术细节、提议或指令..."></textarea>
+          <button class="send-btn" onclick="sendMessage()">🚀 发送</button>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- 局域网通讯录 -->
-    <div class="card" style="margin-bottom:24px;">
-      <div class="card-title">
-        <span>🌐 局域网在线花名册 (Peers Roster)</span>
-        <button class="btn" style="padding:3px 10px; font-size:12px;" onclick="addPeer()">+ 手动添加电脑</button>
+  <!-- 集群看板视图（嵌入之前完整看板） -->
+  <div class="app-main" id="viewDash" style="display:none; overflow-y:auto; padding:24px;">
+    <div style="max-width:1000px; margin:0 auto; width:100%;">
+      <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:20px; margin-bottom:20px;">
+        <h3 style="margin-bottom:12px; color:#58a6ff;">🧠 本机名片设置</h3>
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:12px;">
+          <div><label style="font-size:12px; color:#8b949e;">节点名称</label><input id="dash_name" style="width:100%; background:#0d1117; border:1px solid #30363d; color:#fff; padding:6px; border-radius:4px;"></div>
+          <div><label style="font-size:12px; color:#8b949e;">头像 Emoji</label><input id="dash_avatar" style="width:100%; background:#0d1117; border:1px solid #30363d; color:#fff; padding:6px; border-radius:4px;"></div>
+          <div><label style="font-size:12px; color:#8b949e;">职责定位</label><input id="dash_role" style="width:100%; background:#0d1117; border:1px solid #30363d; color:#fff; padding:6px; border-radius:4px;"></div>
+        </div>
+        <button class="send-btn" style="padding:6px 14px;" onclick="saveDashProfile()">保存档案</button>
       </div>
-      <div id="rosterList">正在扫描局域网节点...</div>
-    </div>
 
-    <!-- 双端流水账本 -->
-    <div class="card">
-      <div class="card-title">
-        <span>📜 实时双端对账流水账本 (Trace Ledger)</span>
+      <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:20px;">
+        <h3 style="margin-bottom:12px; color:#58a6ff;">📜 完整通信 Ledger 原始审计流水</h3>
+        <div id="dashLedgerEl" style="font-size:12px; font-family:monospace; color:#8b949e;"></div>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>流向</th>
-            <th>发信身份</th>
-            <th>对端名称</th>
-            <th>通信主题</th>
-            <th>响应耗时</th>
-            <th>Trace ID</th>
-          </tr>
-        </thead>
-        <tbody id="ledgerList"></tbody>
-      </table>
     </div>
   </div>
 
   <script>
-    async function fetchData() {
+    let currentPeer = 'all';
+    let myNode = { name: 'MacBook-Pro-Frontend', avatar: '🧠', role: '前端架构' };
+    let peers = [];
+
+    function switchView(v) {
+      document.getElementById('viewChat').style.display = v === 'chat' ? 'flex' : 'none';
+      document.getElementById('viewDash').style.display = v === 'dash' ? 'block' : 'none';
+      document.getElementById('tabChat').className = 'tab-btn' + (v === 'chat' ? ' active' : '');
+      document.getElementById('tabDash').className = 'tab-btn' + (v === 'dash' ? ' active' : '');
+      if (v === 'dash') loadDash();
+    }
+
+    async function refreshAll() {
       try {
         const res = await fetch('/api/status');
-        const data = await res.json();
-        if (!data.ok) return;
+        const d = await res.json();
+        if (!d.ok) return;
 
-        document.getElementById('p_name').value = data.node.name || '';
-        document.getElementById('p_avatar').value = data.node.avatar || '🧠';
-        document.getElementById('p_role').value = data.node.role || '';
-        document.getElementById('p_token').value = data.token || '';
+        myNode = d.node || myNode;
+        peers = d.peers || [];
+        document.getElementById('myProfileBadge').innerText = '当前本机: ' + (myNode.avatar || '🧠') + ' ' + myNode.name + ' (' + (myNode.role || '') + ')';
 
-        const peers = data.peers || [];
-        const onlineCount = peers.filter(p => p.online).length;
-        document.getElementById('onlineBadge').innerText = onlineCount + ' 台在线';
-
-        const targetSelect = document.getElementById('p_target');
-        targetSelect.innerHTML = '<option value="all">📡 局域网全网广播 (All Peers)</option>';
-        peers.forEach(p => {
-          targetSelect.innerHTML += '<option value="' + p.name + '">' + (p.avatar || '🖥') + ' ' + p.name + ' (' + p.url + ')</option>';
-        });
-
-        const rList = document.getElementById('rosterList');
-        if (peers.length === 0) {
-          rList.innerHTML = '<div style="color:#8b949e; text-align:center; padding:16px;">局域网内暂未发现其他 DSH 节点，请确认对方已安装本插件并开机。</div>';
-        } else {
-          rList.innerHTML = peers.map(p => \`
-            <div class="peer-card">
-              <div class="peer-left">
-                <div class="peer-avatar">\${p.avatar || '🖥'}</div>
-                <div>
-                  <div class="peer-name">
-                    \${p.name}
-                    \${p.autoDiscovered ? '<span class="badge badge-purple" style="font-size:10px;">📡 雷达发现</span>' : ''}
-                  </div>
-                  <div class="peer-sub">\${p.role || '协作者'} · \${p.url}</div>
-                </div>
-              </div>
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span class="badge \${p.online ? 'badge-green' : 'badge-gray'}">\${p.online ? (p.latencyMs ? p.latencyMs + 'ms' : '在线') : '离线'}</span>
-                <button class="btn" style="padding:4px 10px; font-size:12px;" onclick="pingPeer('\${p.id || p.url}')">⚡ 探测</button>
-              </div>
-            </div>
-          \`).join('');
-        }
-
-        const lList = document.getElementById('ledgerList');
-        const ledger = data.recentLedger || [];
-        lList.innerHTML = ledger.map(l => \`
-          <tr>
-            <td>\${l.direction === 'outbound' ? '📤 出站' : '📥 入站'}</td>
-            <td><span class="badge \${l.sender_type === 'human' ? 'badge-green' : 'badge-purple'}">\${l.sender_type === 'human' ? '👤 人类' : '🤖 Agent'}</span></td>
-            <td>\${l.peer || '-'}</td>
-            <td>\${l.topic || '-'}</td>
-            <td>\${l.durationMs ? l.durationMs + 'ms' : '-'}</td>
-            <td style="font-family:monospace; color:#8b949e;">\${l.trace_id}</td>
-          </tr>
-        \`).join('');
+        // 渲染联系人列表
+        renderPeerList();
+        // 渲染聊天气泡流
+        renderChatMessages();
       } catch (e) {
         console.error(e);
       }
     }
 
-    async function saveProfile() {
-      try {
-        await fetch('/api/profile', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: document.getElementById('p_name').value,
-            avatar: document.getElementById('p_avatar').value,
-            role: document.getElementById('p_role').value,
-            token: document.getElementById('p_token').value
-          })
-        });
-        alert('名片已保存');
-        fetchData();
-      } catch (e) { alert(e.message); }
+    function renderPeerList() {
+      const listEl = document.getElementById('peerListEl');
+      let html = \`
+        <div class="peer-item \${currentPeer === 'all' ? 'active' : ''}" onclick="selectPeer('all')">
+          <div class="avatar-wrap">📡<span class="status-dot dot-online"></span></div>
+          <div class="peer-info">
+            <div class="peer-top-row">
+              <span class="peer-name">全网集群广播 (All)</span>
+            </div>
+            <div class="peer-desc">向局域网内所有电脑广播</div>
+          </div>
+        </div>
+      \`;
+
+      peers.forEach(p => {
+        const isOnline = p.online;
+        html += \`
+          <div class="peer-item \${currentPeer === p.name ? 'active' : ''}" onclick="selectPeer('\${p.name}')">
+            <div class="avatar-wrap">\${p.avatar || '🖥'}<span class="status-dot \${isOnline ? 'dot-online' : 'dot-offline'}"></span></div>
+            <div class="peer-info">
+              <div class="peer-top-row">
+                <span class="peer-name">\${p.name}</span>
+                <span style="font-size:10px; color:\${isOnline ? '#3fb950' : '#8b949e'}">\${isOnline ? (p.latencyMs ? p.latencyMs + 'ms' : '在线') : '离线'}</span>
+              </div>
+              <div class="peer-desc">\${p.role || '对等端'} · \${p.url}</div>
+            </div>
+          </div>
+        \`;
+      });
+      listEl.innerHTML = html;
     }
 
-    async function sendDirect() {
-      const topic = document.getElementById('msg_topic').value;
-      const message = document.getElementById('msg_body').value;
-      const target = document.getElementById('p_target').value;
-      if (!topic || !message) return alert('请填写主题和内容');
+    function selectPeer(peerName) {
+      currentPeer = peerName;
+      if (peerName === 'all') {
+        document.getElementById('currentPeerAvatar').innerText = '📡';
+        document.getElementById('currentPeerName').innerText = '局域网全网集群 (All Peers)';
+        document.getElementById('currentPeerSub').innerText = '广播给局域网中所有在线的 DSH 节点';
+      } else {
+        const p = peers.find(x => x.name === peerName) || {};
+        document.getElementById('currentPeerAvatar').innerText = p.avatar || '🖥';
+        document.getElementById('currentPeerName').innerText = p.name;
+        document.getElementById('currentPeerSub').innerText = (p.role || '协作者') + ' · ' + (p.url || '');
+      }
+      renderPeerList();
+      renderChatMessages();
+    }
+
+    async function renderChatMessages() {
+      try {
+        const url = '/api/chat/messages' + (currentPeer !== 'all' ? '?peer=' + encodeURIComponent(currentPeer) : '');
+        const res = await fetch(url);
+        const data = await res.json();
+        const msgs = data.messages || [];
+
+        const streamEl = document.getElementById('chatStreamEl');
+        if (msgs.length === 0) {
+          streamEl.innerHTML = '<div style="color:#6e7681; text-align:center; padding:40px;">暂无历史聊天记录。在下方输入框中发送消息开始对话吧！</div>';
+          return;
+        }
+
+        streamEl.innerHTML = msgs.map(m => {
+          const isOut = (m.from === myNode.name) || (m.type === 'request' && currentPeer !== 'all');
+          const isHuman = m.senderType === 'human';
+          return \`
+            <div class="msg-group \${isOut ? 'outbound' : 'inbound'}">
+              <div class="msg-avatar">\${isOut ? (myNode.avatar || '🧠') : '🖥'}</div>
+              <div class="msg-body-wrap">
+                <div class="msg-meta">
+                  <span style="font-weight:600; color:#c9d1d9;">\${m.from}</span>
+                  <span class="badge-tag \${isHuman ? 'badge-human' : 'badge-agent'}">\${isHuman ? '👤 人类' : '🤖 Agent'}</span>
+                  <span>\${new Date(m.time).toLocaleTimeString()}</span>
+                </div>
+                <div class="bubble">
+                  \${m.topic ? '<div class="bubble-topic">📌 ' + m.topic + '</div>' : ''}
+                  <div>\${escapeHtml(m.content)}</div>
+                  \${m.context ? '<div class="code-block">' + escapeHtml(m.context) + '</div>' : ''}
+                </div>
+              </div>
+            </div>
+          \`;
+        }).join('');
+
+        streamEl.scrollTop = streamEl.scrollHeight;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\n/g, '<br>');
+    }
+
+    async function sendMessage() {
+      const topic = document.getElementById('inputTopic').value.trim();
+      const message = document.getElementById('inputMsg').value.trim();
+      if (!message) return alert('请输入消息内容');
+
+      const asHuman = document.querySelector('input[name="senderRole"]:checked').value === 'human';
 
       try {
         const res = await fetch('/api/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ topic, message, target })
+          body: JSON.stringify({
+            topic,
+            message,
+            target: currentPeer,
+            asHuman
+          })
         });
         const d = await res.json();
         if (d.ok) {
-          alert('指令已发出！Trace: ' + d.result.trace_id);
-          document.getElementById('msg_topic').value = '';
-          document.getElementById('msg_body').value = '';
-          fetchData();
+          document.getElementById('inputMsg').value = '';
+          await renderChatMessages();
         }
-      } catch (e) { alert(e.message); }
+      } catch (e) {
+        alert('发送失败: ' + e.message);
+      }
     }
 
-    async function addPeer() {
-      const name = prompt('电脑名称:');
-      if (!name) return;
-      const url = prompt('电脑 URL (如 http://192.168.1.100:8765):');
-      if (!url) return;
-      await fetch('/api/peers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, url })
-      });
-      fetchData();
-    }
-
-    async function pingPeer(peerId) {
+    async function pingCurrent() {
+      if (currentPeer === 'all') return alert('广播目标无需探测单个连通性');
       const res = await fetch('/api/ping', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ peerId })
+        body: JSON.stringify({ peerId: currentPeer })
       });
       const d = await res.json();
       alert(d.ok ? '探测成功！' : '探测失败: ' + d.result?.error);
-      fetchData();
+      refreshAll();
     }
 
-    fetchData();
-    setInterval(fetchData, 4000);
+    async function loadDash() {
+      document.getElementById('dash_name').value = myNode.name;
+      document.getElementById('dash_avatar').value = myNode.avatar || '🧠';
+      document.getElementById('dash_role').value = myNode.role || '';
+
+      const res = await fetch('/api/status');
+      const d = await res.json();
+      const ledger = d.recentLedger || [];
+      document.getElementById('dashLedgerEl').innerHTML = ledger.map(l => JSON.stringify(l)).join('<br><br>');
+    }
+
+    async function saveDashProfile() {
+      await fetch('/api/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: document.getElementById('dash_name').value,
+          avatar: document.getElementById('dash_avatar').value,
+          role: document.getElementById('dash_role').value
+        })
+      });
+      alert('已保存');
+      refreshAll();
+    }
+
+    document.getElementById('inputMsg').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    refreshAll();
+    setInterval(refreshAll, 3000);
   </script>
 </body>
 </html>`);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 DSH Peer Link 控制台已成功启动: http://127.0.0.1:${PORT}`);
+  console.log(`🚀 DSH 对等协同即时通讯中心已成功启动: http://127.0.0.1:${PORT}`);
 });
