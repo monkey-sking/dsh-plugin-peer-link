@@ -232,16 +232,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 6. 发送聊天消息并留痕
-  if (url.pathname === '/api/send' && req.method === 'POST') {
+  // 6. 人类控制台专属发信端点（物理路径决定身份，强制 human）
+  if ((url.pathname === '/api/human/send' || url.pathname === '/api/send') && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
       try {
-        const { topic, message, context, target, asHuman } = JSON.parse(body);
+        const { topic, message, context, target } = JSON.parse(body);
         const cfg = loadConfig();
         const traceId = `trace-${Date.now().toString(16)}-${crypto.randomBytes(2).toString('hex')}`;
         const myNode = cfg.node || { name: 'MacBook-Pro-Frontend' };
+        
+        // 关键安全原则：来自 Web 人类控制台路径的请求，身份强制为 human，不接受外部传入伪造
+        const asHuman = true;
         
         let targetPeer = null;
         if (target && target !== 'all') {
@@ -728,15 +731,14 @@ ${replyText}
       <div class="chat-input-area">
         <div class="input-toolbar">
           <div class="role-toggle">
-            <span>发信身份:</span>
-            <label style="cursor:pointer;"><input type="radio" name="senderRole" value="human" checked> 👤 人类指令 (Human)</label>
-            <label style="cursor:pointer; margin-left:8px;"><input type="radio" name="senderRole" value="agent"> 🤖 智能体探讨 (Agent)</label>
+            <span>发信通道:</span>
+            <span class="badge-tag badge-human" style="font-size:11px; padding:2px 8px; font-weight:600;">👤 人类控制台专属直连 (Human Path)</span>
           </div>
-          <span style="font-size:11px; color:#6e7681;">按 Enter 或点击发送</span>
+          <span style="font-size:11px; color:#6e7681;">按 Enter 发送人类指令</span>
         </div>
         <div class="input-row">
           <input class="topic-input" id="inputTopic" placeholder="议题 (如: API数据模型确认)">
-          <textarea class="msg-input" id="inputMsg" placeholder="输入要协商的技术细节、提议或指令..."></textarea>
+          <textarea class="msg-input" id="inputMsg" placeholder="输入要下达给对端 DSH 的工作任务、提议或指令..."></textarea>
           <button class="send-btn" onclick="sendMessage()">🚀 发送</button>
         </div>
       </div>
@@ -894,17 +896,15 @@ ${replyText}
       const message = document.getElementById('inputMsg').value.trim();
       if (!message) return alert('请输入消息内容');
 
-      const asHuman = document.querySelector('input[name="senderRole"]:checked').value === 'human';
-
       try {
-        const res = await fetch('/api/send', {
+        // 走物理通道：/api/human/send（强制标记为人类指令，无法伪造）
+        const res = await fetch('/api/human/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             topic,
             message,
-            target: currentPeer,
-            asHuman
+            target: currentPeer
           })
         });
         const d = await res.json();

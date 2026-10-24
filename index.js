@@ -1203,10 +1203,6 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
           type: 'string',
           description: '可选：目标对等节点名称或 URL。缺省发送给当前首选对端；传 "all" 为全网广播。',
         },
-        as_human: {
-          type: 'boolean',
-          description: '可选：是否代表人类操作者下达指令。true=人类直接指令(human)；false=智能体对等探讨(agent，缺省)。',
-        },
         context: {
           type: 'string',
           description: '可选：附带的上下文片段、代码示例或结构定义。',
@@ -1242,7 +1238,8 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
       const topic = args.topic;
       const message = args.message;
       const context = args.context || '';
-      const asHuman = args.as_human === true;
+      // 核心安全原则：智能体工具链路调用的请求，物理路径决定其身份强制为 agent，无法伪造人类身份
+      const asHuman = false;
       const targetQuery = args.target;
 
       let targetPeers = [];
