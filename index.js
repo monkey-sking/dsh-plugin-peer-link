@@ -426,6 +426,335 @@ export function apply(ctx) {
   let radar = null;
 
   // 1. 启动本地监听服务
+  function renderDashboardHtml() {
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>🤝 DSH Peer Link 控制中心</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #c9d1d9;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1080px; margin: 0 auto; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 20px;
+      border-bottom: 1px solid #30363d;
+      margin-bottom: 24px;
+    }
+    h1 { font-size: 20px; font-weight: 600; color: #58a6ff; display: flex; align-items: center; gap: 8px; }
+    .badge {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 12px;
+      font-weight: 500;
+    }
+    .badge-green { background: rgba(46,160,67,0.15); color: #3fb950; border: 1px solid #238636; }
+    .badge-purple { background: rgba(163,113,247,0.15); color: #a371f7; border: 1px solid #8957e5; }
+    .btn {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #c9d1d9;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: all 0.2s;
+    }
+    .btn:hover { background: #30363d; border-color: #8b949e; }
+    .btn-primary { background: #238636; border-color: #2ea043; color: #fff; }
+    .btn-primary:hover { background: #2ea043; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 18px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #f0f6fc;
+      margin-bottom: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .peer-item {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .peer-left { display: flex; align-items: center; gap: 12px; }
+    .peer-avatar { font-size: 24px; }
+    .peer-name { font-weight: 600; color: #f0f6fc; font-size: 14px; }
+    .peer-sub { font-size: 12px; color: #8b949e; }
+    .input-row { margin-bottom: 12px; }
+    label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 4px; }
+    input, textarea {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      color: #f0f6fc;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; }
+    th { color: #8b949e; font-weight: 500; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🤝 DSH Peer Link 控制中心 <span id="onlineCountBadge" class="badge badge-green">加载中...</span></h1>
+      <div style="display:flex; gap:8px;">
+        <button class="btn" onclick="scanRadar()">📡 局域网雷达扫描</button>
+        <button class="btn" onclick="loadData()">🔄 刷新</button>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- 本机名片 -->
+      <div class="card">
+        <div class="card-title">
+          <span>🧠 本机节点档案 (My Identity)</span>
+          <button class="btn" style="padding:2px 8px; font-size:11px;" onclick="saveMyProfile()">保存名片</button>
+        </div>
+        <div class="input-row">
+          <label>节点名称</label>
+          <input id="my_name" value="">
+        </div>
+        <div style="display:flex; gap:12px;" class="input-row">
+          <div style="flex:1;">
+            <label>头像 Emoji</label>
+            <input id="my_avatar" value="">
+          </div>
+          <div style="flex:2;">
+            <label>职责角色</label>
+            <input id="my_role" value="">
+          </div>
+        </div>
+        <div class="input-row">
+          <label>共享认证密钥 (Token)</label>
+          <input id="my_token" type="password" value="">
+        </div>
+      </div>
+
+      <!-- 人类直接发信 -->
+      <div class="card">
+        <div class="card-title">
+          <span>👤 人类直接指令下发 (Direct Command)</span>
+        </div>
+        <div class="input-row">
+          <label>目标电脑</label>
+          <select id="send_target" style="width:100%; background:#0d1117; border:1px solid #30363d; color:#fff; padding:6px; border-radius:6px; font-size:13px;">
+            <option value="all">📡 局域网全网广播 (All Peers)</option>
+          </select>
+        </div>
+        <div class="input-row">
+          <label>指令主题</label>
+          <input id="send_topic" placeholder="例如：用户中心 API 字段规范确认">
+        </div>
+        <div class="input-row">
+          <label>指令内容</label>
+          <textarea id="send_message" rows="2" placeholder="输入要下发给对端 DSH 的任务或说明..."></textarea>
+        </div>
+        <div style="text-align:right;">
+          <button class="btn btn-primary" onclick="sendMessage()">🚀 发送人类指令</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 局域网在线花名册 -->
+    <div class="card" style="margin-bottom:24px;">
+      <div class="card-title">
+        <span>🌐 局域网发现与对等通讯录 (Peers Roster)</span>
+        <button class="btn" style="padding:2px 8px; font-size:11px;" onclick="addManualPeer()">+ 手动添加</button>
+      </div>
+      <div id="peerList">加载中...</div>
+    </div>
+
+    <!-- 双端对账流水 -->
+    <div class="card">
+      <div class="card-title">
+        <span>📜 实时双端对账流水账本 (Trace Ledger)</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>流向</th>
+            <th>发信角色</th>
+            <th>对端节点</th>
+            <th>主题</th>
+            <th>耗时</th>
+            <th>Trace ID</th>
+          </tr>
+        </thead>
+        <tbody id="ledgerBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function loadData() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        if (!data.ok) return;
+
+        document.getElementById('my_name').value = data.node.name || '';
+        document.getElementById('my_avatar').value = data.node.avatar || '🤖';
+        document.getElementById('my_role').value = data.node.role || '';
+        document.getElementById('my_token').value = data.token || '';
+
+        const peers = data.peers || [];
+        const onlineCount = peers.filter(p => p.online).length;
+        document.getElementById('onlineCountBadge').innerText = onlineCount + ' 台在线';
+
+        // 渲染 target 下拉框
+        const targetSel = document.getElementById('send_target');
+        targetSel.innerHTML = '<option value="all">📡 局域网全网广播 (All Peers)</option>';
+        peers.forEach(p => {
+          targetSel.innerHTML += '<option value="' + p.name + '">' + (p.avatar || '🖥') + ' ' + p.name + ' (' + p.url + ')</option>';
+        });
+
+        // 渲染 Peer 列表
+        const listDiv = document.getElementById('peerList');
+        if (peers.length === 0) {
+          listDiv.innerHTML = '<div style="color:#8b949e; text-align:center; padding:16px;">局域网内暂未发现其他 DSH 节点，请确认对方已安装本插件并开机。</div>';
+        } else {
+          listDiv.innerHTML = peers.map(p => \`
+            <div class="peer-item">
+              <div class="peer-left">
+                <div class="peer-avatar">\${p.avatar || '🖥'}</div>
+                <div>
+                  <div class="peer-name">\${p.name} \${p.autoDiscovered ? '<span class="badge badge-purple" style="font-size:10px;">📡 雷达发现</span>' : ''}</div>
+                  <div class="peer-sub">\${p.role || '对等端'} · \${p.url}</div>
+                </div>
+              </div>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="badge \${p.online ? 'badge-green' : 'badge-offline'}">\${p.online ? (p.latencyMs ? p.latencyMs + 'ms' : '在线') : '离线'}</span>
+                <button class="btn" style="padding:3px 8px; font-size:11px;" onclick="pingPeer('\${p.id || p.url}')">⚡ 探测</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        // 渲染流水
+        const ledgerBody = document.getElementById('ledgerBody');
+        const ledger = data.recentLedger || [];
+        ledgerBody.innerHTML = ledger.map(item => \`
+          <tr>
+            <td>\${item.direction === 'outbound' ? '📤 出站' : '📥 入站'}</td>
+            <td><span class="badge \${item.sender_type === 'human' ? 'badge-green' : 'badge-purple'}">\${item.sender_type === 'human' ? '👤 人类' : '🤖 Agent'}</span></td>
+            <td>\${item.peer || ''}</td>
+            <td>\${item.topic || ''}</td>
+            <td>\${item.durationMs ? item.durationMs + 'ms' : '-'}</td>
+            <td style="font-family:monospace; color:#8b949e;">\${item.trace_id}</td>
+          </tr>
+        \`).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function scanRadar() {
+      try {
+        await fetch('/api/scan', { method: 'POST' });
+        setTimeout(loadData, 700);
+      } catch (e) { alert(e.message); }
+    }
+
+    async function pingPeer(peerId) {
+      try {
+        const res = await fetch('/api/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ peerId })
+        });
+        const d = await res.json();
+        alert(d.ok && d.result?.ok ? '连通成功！延迟: ' + d.result.durationMs + 'ms' : '探测失败: ' + (d.result?.error || '无法连通'));
+        loadData();
+      } catch (e) { alert(e.message); }
+    }
+
+    async function saveMyProfile() {
+      try {
+        await fetch('/api/profile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: document.getElementById('my_name').value,
+            avatar: document.getElementById('my_avatar').value,
+            role: document.getElementById('my_role').value,
+            token: document.getElementById('my_token').value
+          })
+        });
+        alert('名片已保存');
+        loadData();
+      } catch (e) { alert(e.message); }
+    }
+
+    async function sendMessage() {
+      const topic = document.getElementById('send_topic').value;
+      const message = document.getElementById('send_message').value;
+      const target = document.getElementById('send_target').value;
+      if (!topic || !message) return alert('请填写主题和内容');
+
+      try {
+        const res = await fetch('/api/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ topic, message, target, asHuman: true })
+        });
+        const d = await res.json();
+        if (d.ok) {
+          alert('指令发送成功！Trace ID: ' + d.result?.trace_id);
+          document.getElementById('send_topic').value = '';
+          document.getElementById('send_message').value = '';
+          loadData();
+        } else {
+          alert('发送失败: ' + d.error);
+        }
+      } catch (e) { alert(e.message); }
+    }
+
+    async function addManualPeer() {
+      const name = prompt('请输入电脑名称:');
+      if (!name) return;
+      const url = prompt('请输入对端 URL (例如 http://192.168.1.100:8765):');
+      if (!url) return;
+      await fetch('/api/peers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, url })
+      });
+      loadData();
+    }
+
+    loadData();
+    setInterval(loadData, 5000);
+  </script>
+</body>
+</html>`;
+  }
+
   function startHttpServer(port) {
     const srv = http.createServer(async (req, res) => {
       // 允许跨域（本地 Web GUI 访问）
@@ -753,6 +1082,13 @@ export function apply(ctx) {
             res.end(JSON.stringify({ ok: false, error: err.message }));
           }
         });
+        return;
+      }
+
+      // 7. 独立 Web 控制台页面
+      if ((req.url === '/' || req.url === '/dashboard') && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderDashboardHtml());
         return;
       }
 
