@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-plugin-peer-link
+      name: dsh-plugin-peer-link
+      config: {}
