@@ -308,26 +308,56 @@ window.__ModuleLoader__.load({
     }
 
     // API 客户端请求封装
-    async function apiRequest(endpoint, method = "GET", data = null) {
-      // 优先探测本地活动端口
-      const ports = [8765, 8766, 8767, 8768, 8769, 8770];
-      for (const p of ports) {
-        try {
-          const url = `http://127.0.0.1:${p}${endpoint}`;
-          const options = {
-            method,
-            headers: { "Content-Type": "application/json" },
-          };
-          if (data) options.body = JSON.stringify(data);
-          const res = await fetch(url, options);
-          if (res.ok) {
-            return await res.json();
-          }
-        } catch (e) {
-          // 继续尝试下一个端口
+    // 端口探测必须带身份校验：8765-8770 上可能跑着本机其他无关服务，
+    // 只要回 200 就采信会把别人的接口当成 Peer Link 读写。
+    let cachedPort = null;
+    const CANDIDATE_PORTS = [8765, 8766, 8767, 8768, 8769, 8770];
+
+    async function probePeerLinkPort(port) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`, { method: "GET" });
+        if (!res.ok) return false;
+        const d = await res.json();
+        // 必须同时命中本插件的探针契约
+        return d && d.status === "ok" && d.node && typeof d.port === "number";
+      } catch {
+        return false;
+      }
+    }
+
+    async function resolvePort() {
+      if (cachedPort && (await probePeerLinkPort(cachedPort))) return cachedPort;
+      cachedPort = null;
+      for (const p of CANDIDATE_PORTS) {
+        if (await probePeerLinkPort(p)) {
+          cachedPort = p;
+          return p;
         }
       }
       throw new Error("无法连接本地 Peer 服务，请确认插件已启动。");
+    }
+
+    async function apiRequest(endpoint, method = "GET", data = null) {
+      const port = await resolvePort();
+      const url = `http://127.0.0.1:${port}${endpoint}`;
+      const options = {
+        method,
+        headers: { "Content-Type": "application/json" },
+      };
+      if (data) options.body = JSON.stringify(data);
+      const res = await fetch(url, options);
+      if (res.status === 401 || res.status === 403) {
+        throw new Error("本地 Peer 服务拒绝了该请求（鉴权失败）");
+      }
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+          const d = await res.json();
+          if (d && d.error) msg = d.error;
+        } catch {}
+        throw new Error(msg);
+      }
+      return await res.json();
     }
 
     // 侧边栏图标组件

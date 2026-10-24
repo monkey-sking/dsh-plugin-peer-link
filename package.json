@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-peer-link",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
   "description": "Cross-host Peer-to-Peer AI collaboration and real-time trace ledger for DSH",
@@ -38,5 +38,8 @@
     "peer-link",
     "p2p",
     "collaboration"
-  ]
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
 }
