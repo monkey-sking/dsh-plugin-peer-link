@@ -24,6 +24,61 @@ function ensureDirs() {
   if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
+// ===== 安全与容量常量 =====
+const SERVICE_ID = 'dsh-plugin-peer-link';
+const MAX_BODY_BYTES = 1024 * 1024;            // 单请求体上限 1MB，防止内存打爆
+const ONLINE_TTL_MS = 60 * 1000;               // 心跳 15s，超过 60s 未更新即视为离线
+const MAX_LEDGER_LINES = 2000;                 // ledger.jsonl 滚动保留行数
+const MAX_SESSION_FILES = 500;                 // sessions/*.md 保留数量
+const MAX_PORT_FALLBACKS = 10;                 // 端口回退上限，避免无限递归
+
+// 判断请求是否来自本机回环（控制面接口的唯一可信来源）
+function isLoopbackRequest(req) {
+  const addr = req.socket?.remoteAddress || '';
+  const normalized = addr.replace(/^::ffff:/, '');
+  return normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost';
+}
+
+// 同源/CORS 白名单：只允许“本机回环”或“与请求 Host 同源”的来源。
+// 这样既支持 127.0.0.1 访问，也支持用本机主机名打开独立控制台，
+// 同时杜绝任意外部网页跨源读取/写入。
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+function isSameOriginAsRequest(req, origin) {
+  if (!origin) return false;
+  try {
+    const o = new URL(origin);
+    const hostHeader = req.headers.host || '';
+    return o.host === hostHeader;
+  } catch {
+    return false;
+  }
+}
+
+// 恒定时间比较，避免 token 被逐字节时序探测
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a ?? ''), 'utf-8');
+  const bb = Buffer.from(String(b ?? ''), 'utf-8');
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+// 原子写文件：先写临时文件再 rename，避免中途崩溃把配置写坏
+function writeFileAtomic(filePath, content) {
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, content, 'utf-8');
+  fs.renameSync(tmp, filePath);
+}
+
 function loadConfig() {
   ensureDirs();
   const defaultId = 'node-' + crypto.randomBytes(4).toString('hex');
@@ -35,20 +90,13 @@ function loadConfig() {
       role: '全栈架构 · 移动端/UI',
     },
     listen_port: parseInt(process.env.DSH_PEER_PORT || '8765', 10),
+    // 雷达 UDP 端口。同一台机器同时跑多个实例时必须各用一个，
+    // 因为 reuseAddr 会让同端口的多个 socket 互相争抢数据包。
+    radar_port: parseInt(process.env.DSH_PEER_RADAR_PORT || '8764', 10),
     token: process.env.DSH_PEER_TOKEN || 'dsh-peer-secret-shared-token',
-    peers: [
-      {
-        id: 'peer-default',
-        name: process.env.DSH_PEER_TARGET_NAME || 'Node-Beta',
-        avatar: '🖥',
-        role: '后端服务 · 数据引擎',
-        url: process.env.DSH_PEER_TARGET_URL || 'http://127.0.0.1:8766',
-        token: process.env.DSH_PEER_TOKEN || 'dsh-peer-secret-shared-token',
-        online: false,
-        latencyMs: null,
-        last_seen: null,
-      }
-    ]
+    // 出厂通讯录为空：绝不预置指向 127.0.0.1 的“假对端”，
+    // 否则 peer_talk 不传 target 时会取 peers[0] 变成自问自答并伪造审计留痕。
+    peers: []
   };
 
   if (!fs.existsSync(CONFIG_FILE)) {
@@ -83,6 +131,21 @@ function loadConfig() {
         }
       ];
     }
+    // 清理历史版本遗留的“指向本机自己”的占位对端（会造成自问自答的假留痕）
+    if (Array.isArray(parsed.peers)) {
+      parsed.peers = parsed.peers.filter((p) => {
+        if (!p || !p.url) return false;
+        try {
+          const u = new URL(p.url);
+          const selfPort = Number(u.port || 80);
+          const isSelfHost = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname);
+          // 同时命中本机回环 + 本机监听端口 => 指向自己，剔除
+          return !(isSelfHost && selfPort === Number(parsed.listen_port || 8765));
+        } catch {
+          return true;
+        }
+      });
+    }
     return { ...defaultConf, ...parsed, node: { ...defaultConf.node, ...(parsed.node || {}) } };
   } catch {
     return defaultConf;
@@ -91,7 +154,8 @@ function loadConfig() {
 
 function saveConfig(cfg) {
   ensureDirs();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+  // 落盘前统一刷新在线态，避免把 online:true 永久固化进配置文件
+  writeFileAtomic(CONFIG_FILE, JSON.stringify(cfg, null, 2));
 }
 
 function getBroadcastAddresses() {
@@ -120,22 +184,26 @@ class PeerRadar {
     this.socket = null;
     this.heartbeatTimer = null;
     this.cleanupTimer = null;
+    this.lastBroadcast = null;   // 诊断用：最近一次广播的时间/目标/错误
+    this.stats = { sent: 0, failed: 0, received: 0 };
   }
 
   start() {
     try {
       this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
       this.socket.on('error', (err) => {
-        // 端口冲突或网络错误容错
+        this.lastBroadcast = { at: new Date().toISOString(), error: `socket: ${err.message}` };
       });
 
       this.socket.on('message', (msg, rinfo) => {
         try {
           const packet = JSON.parse(msg.toString('utf-8'));
-          if (packet.protocol !== 'dsh-peer-link') return;
+          if (packet.protocol !== SERVICE_ID) return;
           const myInfo = this.getNode();
           if (!myInfo || packet.nodeId === myInfo.id) return;
-          if (myInfo.token && packet.token && myInfo.token !== packet.token) return;
+          // token 必须双向一致：任一方缺失或不匹配都不予采信
+          if (myInfo.token && !safeEqual(packet.token, myInfo.token)) return;
+          this.stats.received += 1;
 
           if (packet.action === 'announce' || packet.action === 'probe') {
             const peerUrl = `http://${rinfo.address}:${packet.httpPort}`;
@@ -178,10 +246,16 @@ class PeerRadar {
         this.broadcast('announce');
       });
 
+      this.socket.on('listening', () => {
+        this.lastBroadcast = { at: new Date().toISOString(), state: 'listening' };
+      });
+
       this.heartbeatTimer = setInterval(() => {
         this.broadcast('announce');
       }, 15000);
-    } catch {}
+    } catch (err) {
+      this.lastBroadcast = { at: new Date().toISOString(), error: err.message };
+    }
   }
 
   broadcast(action = 'announce') {
@@ -190,7 +264,7 @@ class PeerRadar {
       const myInfo = this.getNode();
       if (!myInfo) return;
       const payload = Buffer.from(JSON.stringify({
-        protocol: 'dsh-peer-link',
+        protocol: SERVICE_ID,
         version: '1.0',
         action,
         nodeId: myInfo.id,
@@ -202,10 +276,21 @@ class PeerRadar {
       }));
 
       const addrs = getBroadcastAddresses();
+      this.lastBroadcast = { at: new Date().toISOString(), action, targets: addrs, bytes: payload.length };
       for (const addr of addrs) {
-        this.socket.send(payload, 0, payload.length, this.port, addr, () => {});
+        this.socket.send(payload, 0, payload.length, this.port, addr, (err) => {
+          if (err) {
+            this.stats.failed += 1;
+            this.lastBroadcast = { ...this.lastBroadcast, error: `${addr}: ${err.message}` };
+          } else {
+            this.stats.sent += 1;
+          }
+        });
       }
-    } catch {}
+    } catch (err) {
+      this.stats.failed += 1;
+      this.lastBroadcast = { at: new Date().toISOString(), error: err.message };
+    }
   }
 
   sendTo(ip, port, action = 'announce') {
@@ -224,8 +309,14 @@ class PeerRadar {
         httpPort: myInfo.activePort,
         token: myInfo.token,
       }));
-      this.socket.send(payload, 0, payload.length, port, ip, () => {});
-    } catch {}
+      this.socket.send(payload, 0, payload.length, port, ip, (err) => {
+        if (err) this.stats.failed += 1;
+        else this.stats.sent += 1;
+      });
+    } catch (err) {
+      this.stats.failed += 1;
+      this.lastBroadcast = { at: new Date().toISOString(), error: err.message };
+    }
   }
 
   stop() {
@@ -243,7 +334,30 @@ class PeerRadar {
 function appendLedger(entry) {
   ensureDirs();
   const line = JSON.stringify({ ...entry, _ts: new Date().toISOString() }) + '\n';
-  fs.appendFileSync(LEDGER_FILE, line, 'utf-8');
+  try {
+    fs.appendFileSync(LEDGER_FILE, line, 'utf-8');
+    // 轻量滚动：文件超过阈值时只保留最近 N 行，避免无限膨胀
+    const stat = fs.statSync(LEDGER_FILE);
+    if (stat.size > 512 * 1024) {
+      const lines = fs.readFileSync(LEDGER_FILE, 'utf-8').split('\n').filter(Boolean);
+      if (lines.length > MAX_LEDGER_LINES) {
+        writeFileAtomic(LEDGER_FILE, lines.slice(-MAX_LEDGER_LINES).join('\n') + '\n');
+      }
+    }
+  } catch {}
+}
+
+// 会话文件数量上限，避免长期运行把磁盘塞满
+function pruneSessions() {
+  try {
+    const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.md'));
+    if (files.length <= MAX_SESSION_FILES) return;
+    files.sort();  // 文件名以日期开头，字典序即时间序
+    const stale = files.slice(0, files.length - MAX_SESSION_FILES);
+    for (const f of stale) {
+      try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch {}
+    }
+  } catch {}
 }
 
 function readRecentLedger(limit = 20) {
@@ -290,7 +404,22 @@ ${reply}
 `;
 
   fs.writeFileSync(filePath, md, 'utf-8');
+  pruneSessions();
   return filePath;
+}
+
+// 在线状态 TTL 判定：online 只是缓存值，任何读取都应重新按 last_seen 复算
+function isPeerOnline(peer) {
+  if (!peer) return false;
+  if (!peer.last_seen) return false;
+  const seen = Date.parse(peer.last_seen);
+  if (!Number.isFinite(seen)) return false;
+  return Date.now() - seen < ONLINE_TTL_MS;
+}
+
+// 对外的花名册视图：实时复算 online，杜绝“崩了还永远绿点”
+function publicPeers(cfg) {
+  return (cfg.peers || []).map((p) => ({ ...p, online: isPeerOnline(p) }));
 }
 
 // 自动学习/更新对端信息到本地花名册
@@ -328,7 +457,24 @@ function upsertPeer(cfg, peerData) {
       last_seen: now,
     });
   }
-  saveConfig(cfg);
+  scheduleSave(cfg);
+}
+
+// 高频路径（雷达心跳，15s × N 节点）的写盘合并，避免每包一次同步写阻塞事件循环
+let _saveTimer = null;
+let _pendingCfg = null;
+function scheduleSave(cfg) {
+  _pendingCfg = cfg;
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    if (_pendingCfg) saveConfig(_pendingCfg);
+    _pendingCfg = null;
+  }, 800);
+}
+function flushSave() {
+  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+  if (_pendingCfg) { saveConfig(_pendingCfg); _pendingCfg = null; }
 }
 
 // 发起跨机网络请求
@@ -612,6 +758,17 @@ export function apply(ctx) {
   </div>
 
   <script>
+    // 统一转义：所有来自远端（announce 包 / 入站消息）的字段都不可信
+    function esc(v) {
+      return String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',"'": '&#39;'
+      }[c]));
+    }
+    // 仅允许安全字符进入内联事件参数，避免属性截断逃逸
+    function escAttr(v) {
+      return String(v == null ? '' : v).replace(/[^A-Za-z0-9_.:\-\/]/g, '');
+    }
+
     async function loadData() {
       try {
         const res = await fetch('/api/status');
@@ -621,7 +778,8 @@ export function apply(ctx) {
         document.getElementById('my_name').value = data.node.name || '';
         document.getElementById('my_avatar').value = data.node.avatar || '🤖';
         document.getElementById('my_role').value = data.node.role || '';
-        document.getElementById('my_token').value = data.token || '';
+        // 服务端已不再下发明文 token；留空表示“不修改”，填写则覆盖
+        document.getElementById('my_token').placeholder = data.tokenConfigured ? '已配置，留空则不修改' : '未配置';
 
         const peers = data.peers || [];
         const onlineCount = peers.filter(p => p.online).length;
@@ -629,9 +787,17 @@ export function apply(ctx) {
 
         // 渲染 target 下拉框
         const targetSel = document.getElementById('send_target');
-        targetSel.innerHTML = '<option value="all">📡 局域网全网广播 (All Peers)</option>';
+        targetSel.textContent = '';
+        const allOpt = document.createElement('option');
+        allOpt.value = 'all';
+        allOpt.textContent = '📡 局域网全网广播 (All Peers)';
+        targetSel.appendChild(allOpt);
         peers.forEach(p => {
-          targetSel.innerHTML += '<option value="' + p.name + '">' + (p.avatar || '🖥') + ' ' + p.name + ' (' + p.url + ')</option>';
+          const opt = document.createElement('option');
+          opt.value = p.id || p.url;
+          // textContent 赋值天然免疫 HTML 注入（p.name 来自远端 announce 包，不可信）
+          opt.textContent = \`\${p.avatar || '🖥'} \${p.name} (\${p.url})\`;
+          targetSel.appendChild(opt);
         });
 
         // 渲染 Peer 列表
@@ -642,15 +808,15 @@ export function apply(ctx) {
           listDiv.innerHTML = peers.map(p => \`
             <div class="peer-item">
               <div class="peer-left">
-                <div class="peer-avatar">\${p.avatar || '🖥'}</div>
+                <div class="peer-avatar">\${esc(p.avatar || '🖥')}</div>
                 <div>
-                  <div class="peer-name">\${p.name} \${p.autoDiscovered ? '<span class="badge badge-purple" style="font-size:10px;">📡 雷达发现</span>' : ''}</div>
-                  <div class="peer-sub">\${p.role || '对等端'} · \${p.url}</div>
+                  <div class="peer-name">\${esc(p.name)} \${p.autoDiscovered ? '<span class="badge badge-purple" style="font-size:10px;">📡 雷达发现</span>' : ''}</div>
+                  <div class="peer-sub">\${esc(p.role || '对等端')} · \${esc(p.url)}</div>
                 </div>
               </div>
               <div style="display:flex; align-items:center; gap:8px;">
-                <span class="badge \${p.online ? 'badge-green' : 'badge-offline'}">\${p.online ? (p.latencyMs ? p.latencyMs + 'ms' : '在线') : '离线'}</span>
-                <button class="btn" style="padding:3px 8px; font-size:11px;" onclick="pingPeer('\${p.id || p.url}')">⚡ 探测</button>
+                <span class="badge \${p.online ? 'badge-green' : 'badge-offline'}">\${p.online ? (p.latencyMs ? esc(p.latencyMs) + 'ms' : '在线') : '离线'}</span>
+                <button class="btn" style="padding:3px 8px; font-size:11px;" data-peer="\${escAttr(p.id || p.url)}" onclick="pingPeer(this.dataset.peer)">⚡ 探测</button>
               </div>
             </div>
           \`).join('');
@@ -663,10 +829,10 @@ export function apply(ctx) {
           <tr>
             <td>\${item.direction === 'outbound' ? '📤 出站' : '📥 入站'}</td>
             <td><span class="badge \${item.sender_type === 'human' ? 'badge-green' : 'badge-purple'}">\${item.sender_type === 'human' ? '👤 人类' : '🤖 Agent'}</span></td>
-            <td>\${item.peer || ''}</td>
-            <td>\${item.topic || ''}</td>
-            <td>\${item.durationMs ? item.durationMs + 'ms' : '-'}</td>
-            <td style="font-family:monospace; color:#8b949e;">\${item.trace_id}</td>
+            <td>\${esc(item.peer || '')}</td>
+            <td>\${esc(item.topic || '')}</td>
+            <td>\${item.durationMs ? esc(item.durationMs) + 'ms' : '-'}</td>
+            <td style="font-family:monospace; color:#8b949e;">\${esc(item.trace_id)}</td>
           </tr>
         \`).join('');
       } catch (e) {
@@ -703,7 +869,9 @@ export function apply(ctx) {
             name: document.getElementById('my_name').value,
             avatar: document.getElementById('my_avatar').value,
             role: document.getElementById('my_role').value,
-            token: document.getElementById('my_token').value
+            ...(document.getElementById('my_token').value
+              ? { token: document.getElementById('my_token').value }
+              : {})
           })
         });
         alert('名片已保存');
@@ -755,12 +923,64 @@ export function apply(ctx) {
 </html>`;
   }
 
-  function startHttpServer(port) {
+  // 读取请求体并强制大小上限，超限直接 413
+  function readBody(req, res, onDone) {
+    let body = '';
+    let aborted = false;
+    req.on('data', (c) => {
+      if (aborted) return;
+      body += c;
+      if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `请求体超过 ${MAX_BODY_BYTES} 字节上限` }));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (!aborted) onDone(body);
+    });
+  }
+
+  // 控制面鉴权：本机回环 + 来源校验。
+  // 关键：浏览器发起的请求即使来自外部网页，socket.remoteAddress 也是 127.0.0.1，
+  // 所以必须靠 Origin 判断，否则任意网页都能 CSRF 改配置/读通讯录。
+  // - Origin 存在：仅接受本机回环来源（DSH Web GUI / 控制台自身）
+  // - Origin 缺失：非浏览器调用（curl / agent 工具），要求共享 token
+  function authorizeControlPlane(req, res, reqUrl) {
+    if (!isLoopbackRequest(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '控制面接口仅允许本机访问' }));
+      return false;
+    }
+    const origin = req.headers.origin;
+    if (origin) {
+      if (!isAllowedOrigin(origin) && !isSameOriginAsRequest(req, origin)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: '跨源访问被拒绝' }));
+        return false;
+      }
+      return true;
+    }
+    const provided = req.headers['x-peer-token'] || reqUrl.searchParams.get('token');
+    if (!provided || !safeEqual(provided, cfg.token)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '缺少或错误的 x-peer-token' }));
+      return false;
+    }
+    return true;
+  }
+
+  function startHttpServer(port, attempt = 0) {
+    // CORS 白名单：只回显本机回环来源；无 Origin（同源/curl）不放行跨域头
     const srv = http.createServer(async (req, res) => {
-      // 允许跨域（本地 Web GUI 访问）
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-peer-token');
+      const reqOrigin = req.headers.origin;
+      if (isAllowedOrigin(reqOrigin)) {
+        res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-peer-token');
+      }
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -770,7 +990,7 @@ export function apply(ctx) {
 
       const reqUrl = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
 
-      // 探针接口
+      // 探针接口（对端 ping 用，不含任何敏感信息）
       if (req.method === 'GET' && reqUrl.pathname === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
@@ -788,23 +1008,25 @@ export function apply(ctx) {
       // Web 前端 API: 获取完整状态与花名册
       if (req.method === 'GET' && reqUrl.pathname === '/api/status') {
         cfg = loadConfig();
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: true,
           node: cfg.node,
           activePort,
-          token: cfg.token,
-          peers: cfg.peers,
+          // 绝不下发明文 token，只暴露是否已配置
+          tokenConfigured: Boolean(cfg.token),
+          peers: publicPeers(cfg),
           recentLedger: readRecentLedger(15),
+          radar: radar ? { stats: radar.stats, lastBroadcast: radar.lastBroadcast } : null,
         }));
         return;
       }
 
       // Web 前端 API: 更新本节点名片 (Profile)
       if (req.method === 'POST' && reqUrl.pathname === '/api/profile') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', () => {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        readBody(req, res, (body) => {
           try {
             const data = JSON.parse(body || '{}');
             if (data.name) cfg.node.name = data.name;
@@ -824,15 +1046,14 @@ export function apply(ctx) {
 
       // Web 前端 API: 添加或修改对等节点
       if (req.method === 'POST' && reqUrl.pathname === '/api/peers') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', () => {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        readBody(req, res, (body) => {
           try {
             const data = JSON.parse(body || '{}');
             if (!data.url) throw new Error('缺少对端 URL');
             upsertPeer(cfg, data);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, peers: cfg.peers }));
+            res.end(JSON.stringify({ ok: true, peers: publicPeers(cfg) }));
           } catch (e) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -843,15 +1064,14 @@ export function apply(ctx) {
 
       // Web 前端 API: 删除对等节点
       if (req.method === 'DELETE' && reqUrl.pathname === '/api/peers') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', () => {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        readBody(req, res, (body) => {
           try {
             const data = JSON.parse(body || '{}');
             cfg.peers = cfg.peers.filter((p) => p.id !== data.id && p.url !== data.url);
             saveConfig(cfg);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, peers: cfg.peers }));
+            res.end(JSON.stringify({ ok: true, peers: publicPeers(cfg) }));
           } catch (e) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -862,16 +1082,15 @@ export function apply(ctx) {
 
       // Web 前端 API: 探测对端连通性
       if (req.method === 'POST' && reqUrl.pathname === '/api/ping') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', async () => {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        readBody(req, res, async (body) => {
           try {
             const data = JSON.parse(body || '{}');
             const target = data.peerId ? cfg.peers.find((p) => p.id === data.peerId) : cfg.peers[0];
             if (!target) throw new Error('未找到指定对等节点');
             const result = await pingPeer(cfg, target);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, result, peers: cfg.peers }));
+            res.end(JSON.stringify({ ok: true, result, peers: publicPeers(cfg) }));
           } catch (e) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -882,9 +1101,8 @@ export function apply(ctx) {
 
       // Web 前端 API: 人类直接在 Web 发信
       if (req.method === 'POST' && reqUrl.pathname === '/api/send') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', async () => {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        readBody(req, res, async (body) => {
           try {
             const data = JSON.parse(body || '{}');
             const target = data.peerId ? cfg.peers.find((p) => p.id === data.peerId) : cfg.peers[0];
@@ -959,6 +1177,7 @@ export function apply(ctx) {
 
       // Web 前端 API: 局域网 UDP 雷达主动扫描
       if (req.method === 'POST' && reqUrl.pathname === '/api/scan') {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
         if (radar) {
           radar.broadcast('probe');
         }
@@ -966,12 +1185,17 @@ export function apply(ctx) {
           cfg = loadConfig();
         }, 500);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, message: '局域网雷达探测广播已发送' }));
+        res.end(JSON.stringify({
+          ok: true,
+          message: '局域网雷达探测广播已发送',
+          radar: radar ? { stats: radar.stats, lastBroadcast: radar.lastBroadcast } : null,
+        }));
         return;
       }
 
       // Web 前端 API: 历史会话列表与详情
       if (req.method === 'GET' && reqUrl.pathname === '/api/sessions') {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
         try {
           const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.md')).reverse();
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -984,6 +1208,7 @@ export function apply(ctx) {
       }
 
       if (req.method === 'GET' && reqUrl.pathname === '/api/session') {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
         const file = reqUrl.searchParams.get('file');
         const safePath = path.join(SESSIONS_DIR, path.basename(file || ''));
         if (fs.existsSync(safePath)) {
@@ -999,34 +1224,55 @@ export function apply(ctx) {
 
       // 核心跨机协商通信接口 /talk (双向通信)
       if (req.method === 'POST' && reqUrl.pathname === '/talk') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
+        readBody(req, res, async (body) => {
           try {
             const payload = JSON.parse(body || '{}');
             const { trace_id, sender, topic, message, context, token, intent = 'proposal' } = payload;
 
-            // 安全 Token 校验
-            if (cfg.token && token && token !== cfg.token) {
+            // 安全 Token 校验：必须提供且必须匹配。
+            // 旧版写成 `cfg.token && token && token !== cfg.token`，漏传 token 字段即可绕过。
+            if (!cfg.token || !token || !safeEqual(token, cfg.token)) {
               res.writeHead(401, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, error: 'Token 认证失败: 密钥不匹配' }));
+              res.end(JSON.stringify({ ok: false, error: 'Token 认证失败: 缺少或错误的共享密钥' }));
               return;
             }
 
             const senderObj = sender || { name: '远端节点', avatar: '💻', role: '协作者', type: 'agent' };
 
             // 自动学习对方节点信息，充实本地通讯录 (Roster Auto-Learning)
-            if (senderObj.url || req.headers.host) {
-              const remoteIp = req.socket.remoteAddress;
-              const guessedUrl = senderObj.url || `http://${remoteIp}:${activePort}`;
-              upsertPeer(cfg, {
-                id: senderObj.id,
-                name: senderObj.name,
-                avatar: senderObj.avatar,
-                role: senderObj.role,
-                url: guessedUrl,
-                online: true,
-              });
+            // 旧实现用 `${activePort}` 拼对端 URL —— 那是「本机监听端口」，不是对端端口，
+            // 结果把访客记成了指向自己的对端（自问自答的根源）。
+            // 现在只采信对端自己声明的 URL；没有就跳过，绝不臆造。
+            if (senderObj.url) {
+              const remoteIp = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+              let learnUrl = null;
+              try {
+                const u = new URL(senderObj.url);
+                // 只接受 http(s)，且没有提供端口时补默认端口
+                if (u.protocol === 'http:' || u.protocol === 'https:') {
+                  learnUrl = u.toString().replace(/\/+$/, '');
+                }
+              } catch {}
+              // 防御：解析出的主机若就是本机回环且端口等于本机端口，说明是自指，丢弃
+              if (learnUrl) {
+                try {
+                  const lu = new URL(learnUrl);
+                  const isSelf =
+                    ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(lu.hostname) &&
+                    Number(lu.port || 80) === Number(activePort);
+                  if (isSelf) learnUrl = null;
+                } catch {}
+              }
+              if (learnUrl) {
+                upsertPeer(cfg, {
+                  id: senderObj.id,
+                  name: senderObj.name,
+                  avatar: senderObj.avatar,
+                  role: senderObj.role,
+                  url: learnUrl,
+                  online: true,
+                });
+              }
             }
 
             // 区分人类发出的消息 vs 智能体发出的消息
@@ -1099,16 +1345,27 @@ export function apply(ctx) {
 
     srv.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
+        // 回退必须是原子的：旧实例先彻底关闭，且新实例的句柄要回写到外层 server，
+        // 否则 dispose() 关掉的永远是被 close 过的旧句柄，真正监听的 socket 会残留。
+        if (attempt >= MAX_PORT_FALLBACKS) {
+          console.error(`[peer-link] 端口 ${cfg.listen_port}~${port} 全部被占用，放弃监听`);
+          return;
+        }
+        try { srv.close(); } catch {}
         const nextPort = port + 1;
-        srv.close();
-        startHttpServer(nextPort);
+        server = startHttpServer(nextPort, attempt + 1);
+      } else {
+        console.error(`[peer-link] HTTP 服务异常: ${err.message}`);
       }
     });
 
     srv.listen(port, '0.0.0.0', () => {
       activePort = port;
       try {
-        fs.writeFileSync(path.join(PEER_DIR, 'active_port.json'), JSON.stringify({ port: activePort }), 'utf-8');
+        writeFileAtomic(
+          path.join(PEER_DIR, 'active_port.json'),
+          JSON.stringify({ port: activePort, pid: process.pid, at: new Date().toISOString() })
+        );
       } catch {}
     });
 
@@ -1119,7 +1376,7 @@ export function apply(ctx) {
 
   // 启动局域网 UDP 自动雷达发现服务
   radar = new PeerRadar({
-    port: 8764,
+    port: cfg.radar_port || 8764,
     getNode: () => ({
       id: cfg.node.id,
       name: cfg.node.name,
@@ -1152,7 +1409,7 @@ export function apply(ctx) {
           autoDiscovered: true,
         });
       }
-      saveConfig(cfg);
+      scheduleSave(cfg);
     },
   });
   radar.start();
@@ -1498,7 +1755,7 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
           node: cfg.node,
           listen_port: activePort,
           token: cfg.token ? '已配置 (******)' : '未配置',
-          peers: cfg.peers,
+          peers: publicPeers(cfg),
           ledger_dir: SESSIONS_DIR,
           status: 'listening',
         };
@@ -1520,14 +1777,14 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
           url: args.peer_url,
           token: args.token || cfg.token,
         });
-        return { ok: true, peers: cfg.peers, message: '对等节点已添加到花名册' };
+        return { ok: true, peers: publicPeers(cfg), message: '对等节点已添加到花名册' };
       }
 
       if (args.action === 'remove_peer') {
         const query = args.peer_name || args.peer_url;
         cfg.peers = cfg.peers.filter((p) => p.name !== query && p.url !== query && p.id !== query);
         saveConfig(cfg);
-        return { ok: true, peers: cfg.peers, message: '已从花名册移除该节点' };
+        return { ok: true, peers: publicPeers(cfg), message: '已从花名册移除该节点' };
       }
 
       if (args.action === 'test_ping') {
@@ -1558,12 +1815,14 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
         }
         await new Promise((r) => setTimeout(r, 600));
         cfg = loadConfig();
-        const onlineCount = cfg.peers.filter((p) => p.online).length;
+        const livePeers = publicPeers(cfg);
+        const onlineCount = livePeers.filter((p) => p.online).length;
         return {
           ok: true,
           message: `局域网雷达探测完毕，当前共发现 ${onlineCount} 台在线 DSH 电脑`,
           onlineCount,
-          peers: cfg.peers,
+          peers: livePeers,
+          radar: radar ? { stats: radar.stats, lastBroadcast: radar.lastBroadcast } : null,
         };
       }
 
@@ -1572,6 +1831,7 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
   });
 
   return () => {
+    flushSave();
     if (radar) {
       radar.stop();
       radar = null;
