@@ -214,7 +214,7 @@ const server = http.createServer((req, res) => {
         if (!peer) throw new Error('未找到该对等节点');
 
         const start = Date.now();
-        const pingUrl = `${peer.url.replace(/\/+$/, '')}/api/health`;
+        const pingUrl = `${peer.url.replace(/\/+$/, '')}/health`;
         const r = await fetch(pingUrl, { signal: AbortSignal.timeout(1500) });
         const latency = Date.now() - start;
         peer.online = r.ok;
@@ -263,12 +263,14 @@ const server = http.createServer((req, res) => {
               topic: topic || '聊天消息',
               message,
               context,
+              token: targetPeer.token || cfg.token,
               as_human: !!asHuman,
               sender: {
                 name: myNode.name,
                 avatar: myNode.avatar || '🧠',
                 role: myNode.role || '协作者',
-                type: asHuman ? 'human' : 'agent'
+                type: asHuman ? 'human' : 'agent',
+                url: `http://192.168.31.124:${cfg.listen_port || 8765}`
               }
             };
             const r = await fetch(postUrl, {
@@ -534,6 +536,7 @@ ${replyText}
     .chat-messages {
       flex: 1;
       overflow-y: auto;
+      scroll-behavior: smooth;
       padding: 20px 24px;
       display: flex;
       flex-direction: column;
@@ -842,10 +845,13 @@ ${replyText}
         document.getElementById('currentPeerSub').innerText = (p.role || '协作者') + ' · ' + (p.url || '');
       }
       renderPeerList();
-      renderChatMessages();
+      renderChatMessages(true);
     }
 
-    async function renderChatMessages() {
+    let lastRenderedMsgCount = 0;
+    let lastRenderedMsgId = '';
+
+    async function renderChatMessages(forceScroll = false) {
       try {
         const url = '/api/chat/messages' + (currentPeer !== 'all' ? '?peer=' + encodeURIComponent(currentPeer) : '');
         const res = await fetch(url);
@@ -855,8 +861,24 @@ ${replyText}
         const streamEl = document.getElementById('chatStreamEl');
         if (msgs.length === 0) {
           streamEl.innerHTML = '<div style="color:#6e7681; text-align:center; padding:40px;">暂无历史聊天记录。在下方输入框中发送消息开始对话吧！</div>';
+          lastRenderedMsgCount = 0;
+          lastRenderedMsgId = '';
           return;
         }
+
+        const latestMsg = msgs[msgs.length - 1];
+        const latestMsgId = latestMsg.id || (latestMsg.traceId + '-' + latestMsg.type);
+
+        // 如果消息总数和最新一条均无变化，且非强制滚动，则跳过重绘，保护用户当前阅读和滚动状态
+        if (!forceScroll && msgs.length === lastRenderedMsgCount && latestMsgId === lastRenderedMsgId) {
+          return;
+        }
+
+        // 检查用户当前是否在底部附近（距离底部 80px 以内）
+        const isNearBottom = (streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight) < 80;
+
+        lastRenderedMsgCount = msgs.length;
+        lastRenderedMsgId = latestMsgId;
 
         streamEl.innerHTML = msgs.map(m => {
           const isOut = (m.from === myNode.name) || (m.type === 'request' && currentPeer !== 'all');
@@ -880,7 +902,11 @@ ${replyText}
           \`;
         }).join('');
 
-        streamEl.scrollTop = streamEl.scrollHeight;
+        // 关键体验优化：只有当用户原本就在底部附近，或者刚发送了新消息时，才滚到底部；
+        // 如果用户正在往上滚动看历史记录，绝不打扰，保持当前滚动位置！
+        if (forceScroll || isNearBottom) {
+          streamEl.scrollTop = streamEl.scrollHeight;
+        }
       } catch (e) {
         console.error(e);
       }
@@ -910,7 +936,7 @@ ${replyText}
         const d = await res.json();
         if (d.ok) {
           document.getElementById('inputMsg').value = '';
-          await renderChatMessages();
+          await renderChatMessages(true);
         }
       } catch (e) {
         alert('发送失败: ' + e.message);
