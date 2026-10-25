@@ -18,10 +18,57 @@ const PEER_DIR = dshHomePath('peer-link');
 const CONFIG_FILE = path.join(PEER_DIR, 'config.json');
 const SESSIONS_DIR = path.join(PEER_DIR, 'sessions');
 const LEDGER_FILE = path.join(PEER_DIR, 'ledger.jsonl');
+const SERVERS_FILE = path.join(PEER_DIR, 'servers.json');
 
 function ensureDirs() {
   if (!fs.existsSync(PEER_DIR)) fs.mkdirSync(PEER_DIR, { recursive: true });
   if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+}
+
+function loadServers() {
+  ensureDirs();
+  if (!fs.existsSync(SERVERS_FILE)) return [];
+  try {
+    const raw = fs.readFileSync(SERVERS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveServers(servers) {
+  ensureDirs();
+  const list = Array.isArray(servers) ? servers : [];
+  writeFileAtomic(SERVERS_FILE, JSON.stringify(list, null, 2));
+}
+
+function mergeServers(incomingList, sourcePeerName) {
+  if (!Array.isArray(incomingList) || incomingList.length === 0) return 0;
+  const current = loadServers();
+  let addedCount = 0;
+  for (const item of incomingList) {
+    if (!item || (!item.host && !item.name)) continue;
+    const existingIndex = current.findIndex(
+      (s) =>
+        (s.id && item.id && s.id === item.id) ||
+        (s.host === item.host && Number(s.port || 22) === Number(item.port || 22))
+    );
+    const enriched = {
+      ...item,
+      id: item.id || `srv-${crypto.randomBytes(4).toString('hex')}`,
+      source_peer: item.source_peer || sourcePeerName || 'remote',
+      synced_at: new Date().toISOString(),
+    };
+    if (existingIndex >= 0) {
+      current[existingIndex] = { ...current[existingIndex], ...enriched };
+    } else {
+      current.push(enriched);
+      addedCount++;
+    }
+  }
+  saveServers(current);
+  return addedCount;
 }
 
 // ===== 安全与容量常量 =====
@@ -371,6 +418,120 @@ function readRecentLedger(limit = 20) {
   } catch {
     return [];
   }
+}
+
+function dispatchPeerRequest({ topic, message, context, action, query, params, sender, cfg }) {
+  const t = (topic || '').trim();
+  const m = (message || '').trim();
+
+  // 1. 服务器/主机资产查询
+  const isServerQuery =
+    action === 'query_servers' ||
+    query === 'servers' ||
+    /服务器|server|主机|跳板机|远程机|机器资产/i.test(t) ||
+    /服务器|server|主机|跳板机|远程机|同步服务器/i.test(m);
+
+  if (isServerQuery) {
+    const servers = loadServers();
+    if (servers.length === 0) {
+      return {
+        reply: `【${cfg.node.name} · 资产应答】本端目前未登记专属服务器资产。\n- 如需登记，可在本端 Web 控制台 (/api/servers) 添加，或编辑 ~/.dsh/peer-link/servers.json。\n- 已为本端生成资产档案结构，等待后续同步。`,
+        payload: { kind: 'servers', items: [] },
+      };
+    }
+    const lines = [
+      `【${cfg.node.name} · 资产自动同步】本端已就绪 ${servers.length} 项服务器资产：`,
+      ...servers.map(
+        (s, idx) =>
+          `${idx + 1}. [${s.name || '未命名服务器'}] (${s.host}:${s.port || 22})\n` +
+          `   • 角色/定位: ${s.role || s.description || '通用主机'}\n` +
+          `   • 登录账户: ${s.user || 'root'} (SSH)\n` +
+          `   • 分组标签: ${(s.tags || []).join(', ') || 'server'}`
+      ),
+      `\n（详细规格数据已随结构化 Payload 打包回传，对端可自动落盘入库）`,
+    ];
+    return {
+      reply: lines.join('\n'),
+      payload: { kind: 'servers', items: servers },
+    };
+  }
+
+  // 2. 系统环境与运行时查询
+  const isSystemQuery =
+    action === 'query_system' ||
+    query === 'system' ||
+    /系统状态|环境信息|运行时|node版本|硬件架构|system info/i.test(t) ||
+    /系统状态|环境信息|node版本|硬件架构/i.test(m);
+
+  if (isSystemQuery) {
+    const memTotal = Math.round(os.totalmem() / 1024 / 1024 / 1024);
+    const memFree = Math.round(os.freemem() / 1024 / 1024 / 1024);
+    const cpus = os.cpus() || [];
+    const cpuModel = cpus.length > 0 ? cpus[0].model : 'Unknown';
+    const lines = [
+      `【${cfg.node.name} · 系统环境指标】`,
+      `• 主机系统: ${os.type()} ${os.release()} (${os.arch()})`,
+      `• CPU 核心: ${cpus.length} 核心 (${cpuModel})`,
+      `• 内存状态: 剩余 ${memFree} GB / 总计 ${memTotal} GB`,
+      `• Node 版本: ${process.version}`,
+      `• DSH 角色: ${cfg.node.role || '对等协作节点'}`,
+      `• 运行时长: ${Math.round(process.uptime())} 秒`,
+    ];
+    return {
+      reply: lines.join('\n'),
+      payload: {
+        kind: 'system',
+        items: [
+          {
+            os: `${os.type()} ${os.release()}`,
+            arch: os.arch(),
+            cpu: cpuModel,
+            cpuCores: cpus.length,
+            memFreeGb: memFree,
+            memTotalGb: memTotal,
+            nodeVersion: process.version,
+            uptimeSec: Math.round(process.uptime()),
+          },
+        ],
+      },
+    };
+  }
+
+  // 3. 协同任务与看板进度查询
+  const isTaskQuery =
+    action === 'query_tasks' ||
+    query === 'tasks' ||
+    /任务看板|看板进度|当前任务|工作进展/i.test(t);
+
+  if (isTaskQuery) {
+    const recent = readRecentLedger(5);
+    const lines = [
+      `【${cfg.node.name} · 协同进度与近期流水】`,
+      ...(recent.length > 0
+        ? recent.map(
+            (r) =>
+              `• [${r.direction === 'inbound' ? '收' : '发'}] ${r.peer}: 《${r.topic}》 (${(r._ts || '').slice(11, 19)})`
+          )
+        : ['• 暂无近期流水']),
+    ];
+    return {
+      reply: lines.join('\n'),
+      payload: { kind: 'tasks', items: recent },
+    };
+  }
+
+  // 4. 默认常规协商与指令分发
+  const isHuman = sender.type === 'human';
+  let replyContent = '';
+  if (isHuman) {
+    replyContent = `【${cfg.node.name} · 智能体响应指令】\n- 指令类型: 来自人类操作者的顶层业务指示 (来自 ${sender.avatar || '👤'} ${sender.name})\n- 接收状态: 已接收并纳入当前工作区最高优先级执行规划。\n- 确认主题: “${t}”\n- 正文反馈: “${m}” 已由本端 DSH 理解并落盘准备推进。`;
+  } else {
+    replyContent = `【${cfg.node.name} · 对等智能体协商响应】\n- 协同类型: 同级智能体跨机技术对齐\n- 来源对端: ${sender.avatar || '🤖'} ${sender.name} (${sender.role || '对等端'})\n- 确认主题: ${t}\n- 处理结果: 已成功接收对端提议与代码上下文，已存入本地审计留痕，双方契约已同步。`;
+  }
+  return {
+    reply: replyContent,
+    payload: null,
+  };
 }
 
 function recordSessionMarkdown({ traceId, sender, receiver, topic, message, context, reply, durationMs, status = 'completed' }) {
@@ -1080,6 +1241,68 @@ export function apply(ctx) {
         return;
       }
 
+      // Web 前端 API: 获取服务器资产列表
+      if (req.method === 'GET' && reqUrl.pathname === '/api/servers') {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, servers: loadServers() }));
+        return;
+      }
+
+      // Web 前端 API: 添加/更新服务器资产
+      if (req.method === 'POST' && reqUrl.pathname === '/api/servers') {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        readBody(req, res, (body) => {
+          try {
+            const data = JSON.parse(body || '{}');
+            if (!data.host && !data.name) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'host 或 name 必填' }));
+              return;
+            }
+            const current = loadServers();
+            const srv = {
+              id: data.id || `srv-${crypto.randomBytes(4).toString('hex')}`,
+              name: data.name || data.host,
+              host: data.host || '',
+              port: Number(data.port || 22),
+              user: data.user || 'root',
+              role: data.role || '服务器',
+              tags: Array.isArray(data.tags)
+                ? data.tags
+                : typeof data.tags === 'string'
+                ? data.tags.split(',').map((t) => t.trim()).filter(Boolean)
+                : [],
+              description: data.description || '',
+              source_peer: 'local',
+              updated_at: new Date().toISOString(),
+            };
+            const idx = current.findIndex((s) => s.id === srv.id);
+            if (idx >= 0) current[idx] = srv;
+            else current.push(srv);
+            saveServers(current);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, server: srv, servers: current }));
+          } catch (e) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // Web 前端 API: 删除服务器资产
+      if (req.method === 'DELETE' && reqUrl.pathname.startsWith('/api/servers/')) {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        const targetId = reqUrl.pathname.replace('/api/servers/', '');
+        const current = loadServers();
+        const filtered = current.filter((s) => s.id !== targetId);
+        saveServers(filtered);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, deleted: targetId, servers: filtered }));
+        return;
+      }
+
       // Web 前端 API: 探测对端连通性
       if (req.method === 'POST' && reqUrl.pathname === '/api/ping') {
         if (!authorizeControlPlane(req, res, reqUrl)) return;
@@ -1279,13 +1502,18 @@ export function apply(ctx) {
             const isHuman = senderObj.type === 'human';
             const traceId = trace_id || `trace-${Date.now()}`;
 
-            // 生成协商回复内容
-            let replyContent = '';
-            if (isHuman) {
-              replyContent = `【${cfg.node.name} · 智能体响应指令】\n- 指令类型: 来自人类操作者的顶层业务指示 (来自 ${senderObj.avatar || '👤'} ${senderObj.name})\n- 接收状态: 已接收并纳入当前工作区最高优先级执行规划。\n- 确认主题: “${topic}”\n- 正文反馈: “${message}” 已由本端 DSH 理解并落盘准备推进。`;
-            } else {
-              replyContent = `【${cfg.node.name} · 对等智能体协商响应】\n- 协同类型: 同级智能体跨机技术对齐\n- 来源对端: ${senderObj.avatar || '🤖'} ${senderObj.name} (${senderObj.role || '对等端'})\n- 确认主题: ${topic}\n- 处理结果: 已成功接收对端提议与代码上下文，已存入本地审计留痕，双方契约已同步。`;
-            }
+            // 调用意图分发器，执行真实检索或动态处理
+            const dispatchResult = dispatchPeerRequest({
+              topic: topic || '对等协作通信',
+              message: message || '',
+              context: context || '',
+              action: payload.action,
+              query: payload.query,
+              params: payload.params,
+              sender: senderObj,
+              cfg,
+            });
+            const replyContent = dispatchResult.reply;
 
             // 落盘双端留痕文件
             const sessionPath = recordSessionMarkdown({
@@ -1319,6 +1547,7 @@ export function apply(ctx) {
                   type: 'agent',
                 },
                 reply: replyContent,
+                payload: dispatchResult.payload,
                 sessionPath,
                 timestamp: new Date().toISOString(),
               })
@@ -1460,6 +1689,10 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
           type: 'string',
           description: '可选：目标对等节点名称或 URL。缺省发送给当前首选对端；传 "all" 为全网广播。',
         },
+        action: {
+          type: 'string',
+          description: '可选：特定操作意图，如 query_servers(查询服务器资产)、query_system(查询系统环境)、query_tasks(查询任务进度)。',
+        },
         context: {
           type: 'string',
           description: '可选：附带的上下文片段、代码示例或结构定义。',
@@ -1542,10 +1775,19 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
                 topic,
                 message,
                 context,
+                action: args.action || '',
                 token: peer.token || cfg.token,
                 intent: asHuman ? 'command' : 'proposal',
               });
-              const replyText = res.data?.reply || (res.statusCode === 200 ? '已处理' : `HTTP ${res.statusCode}`);
+              let replyText = res.data?.reply || (res.statusCode === 200 ? '已处理' : `HTTP ${res.statusCode}`);
+              if (
+                res.data?.payload?.kind === 'servers' &&
+                Array.isArray(res.data.payload.items) &&
+                res.data.payload.items.length > 0
+              ) {
+                const added = mergeServers(res.data.payload.items, peer.name);
+                replyText += ` [已自动同步 ${added} 项服务器资产]`;
+              }
               upsertPeer(cfg, { ...peer, online: true, last_seen: new Date().toISOString() });
               return { peer: peer.name, ok: res.statusCode === 200, reply: replyText };
             } catch (err) {
@@ -1594,6 +1836,8 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
         };
       }
 
+      const action = args.action || '';
+
       const targetPeer = targetPeers[0];
       const traceId = `trace-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`;
       const startMs = Date.now();
@@ -1607,13 +1851,25 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
           topic,
           message,
           context,
+          action,
           token: targetPeer.token || cfg.token,
           intent: asHuman ? 'command' : 'proposal',
         });
 
         const durationMs = Date.now() - startMs;
         const resData = res.data || {};
-        const replyText = resData.reply || (res.statusCode === 200 ? '对端已接收并处理' : `HTTP ${res.statusCode}`);
+        let replyText = resData.reply || (res.statusCode === 200 ? '对端已接收并处理' : `HTTP ${res.statusCode}`);
+
+        // 核心突破：如果对端回传了结构化资产（如服务器资产），发起端自动落盘入库！
+        if (
+          resData.payload &&
+          resData.payload.kind === 'servers' &&
+          Array.isArray(resData.payload.items) &&
+          resData.payload.items.length > 0
+        ) {
+          const added = mergeServers(resData.payload.items, targetPeer.name);
+          replyText += `\n\n📥【自动资产同步】已将对端回传的 ${resData.payload.items.length} 项服务器资产合并入本地档案 (~/.dsh/peer-link/servers.json)，更新/入库: ${added} 项！`;
+        }
 
         // 自动更新该对端的在线状态与延迟
         upsertPeer(cfg, {

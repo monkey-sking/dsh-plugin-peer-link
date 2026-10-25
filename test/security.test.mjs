@@ -292,3 +292,81 @@ test('仪表盘对所有远端字段做 HTML 转义', async () => {
     );
   }
 });
+
+test('PeerDispatcher: /api/servers 支持登记与查阅服务器资产', async () => {
+  // 1. 添加测试服务器
+  const addRes = await request('/api/servers', {
+    method: 'POST',
+    headers: auth,
+    body: {
+      name: 'Instabox 测试机',
+      host: 'dashboard.instabox.sh',
+      port: 22,
+      user: 'root',
+      role: '快照沙箱',
+      tags: ['cloud', 'sandbox'],
+      description: '远程测试沙箱',
+    },
+  });
+  assert.equal(addRes.status, 200);
+  assert.equal(addRes.json.ok, true);
+  assert.equal(addRes.json.server.host, 'dashboard.instabox.sh');
+
+  // 2. 查阅列表
+  const listRes = await request('/api/servers', { headers: auth });
+  assert.equal(listRes.status, 200);
+  assert.ok(Array.isArray(listRes.json.servers));
+  assert.ok(listRes.json.servers.some((s) => s.host === 'dashboard.instabox.sh'));
+});
+
+test('PeerDispatcher: /talk 接收跨机服务器同步请求并返回结构化 Payload', async () => {
+  // 发起对等请求，询问服务器信息
+  const res = await request('/talk', {
+    method: 'POST',
+    body: {
+      topic: '服务器资产同步核对',
+      message: '请同步你那边的服务器信息',
+      action: 'query_servers',
+      token: TOKEN,
+      sender: { name: 'Node-Beta', avatar: '💻', role: '测试端', type: 'agent' },
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.ok, true);
+  assert.ok(res.json.reply.includes('资产自动同步'));
+  assert.ok(res.json.reply.includes('dashboard.instabox.sh'));
+  assert.equal(res.json.payload?.kind, 'servers');
+  assert.ok(res.json.payload.items.length >= 1);
+});
+
+test('PeerDispatcher: /talk 支持语义隐式识别服务器查询', async () => {
+  const res = await request('/talk', {
+    method: 'POST',
+    body: {
+      topic: '架构对齐',
+      message: '这台电脑不知道某个远程服务器，你发我一下',
+      token: TOKEN,
+      sender: { name: 'Node-Beta', avatar: '💻', role: '测试端', type: 'agent' },
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.json.reply.includes('资产自动同步'));
+  assert.equal(res.json.payload?.kind, 'servers');
+});
+
+test('PeerDispatcher: /talk 支持系统环境指标动态查询', async () => {
+  const res = await request('/talk', {
+    method: 'POST',
+    body: {
+      topic: '环境核查',
+      message: '查询当前节点的系统状态和node版本',
+      action: 'query_system',
+      token: TOKEN,
+      sender: { name: 'Node-Beta', avatar: '💻', role: '测试端', type: 'agent' },
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.json.reply.includes('系统环境指标'));
+  assert.equal(res.json.payload?.kind, 'system');
+  assert.ok(res.json.payload.items[0].nodeVersion.startsWith('v'));
+});

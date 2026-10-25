@@ -9,6 +9,23 @@ const PEER_DIR = path.join(os.homedir(), '.dsh', 'peer-link');
 const SESSIONS_DIR = path.join(PEER_DIR, 'sessions');
 const CONFIG_FILE = path.join(PEER_DIR, 'config.json');
 const LEDGER_FILE = path.join(PEER_DIR, 'ledger.jsonl');
+const SERVERS_FILE = path.join(PEER_DIR, 'servers.json');
+
+function loadServers() {
+  if (!fs.existsSync(SERVERS_FILE)) return [];
+  try {
+    const raw = fs.readFileSync(SERVERS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveServers(servers) {
+  const list = Array.isArray(servers) ? servers : [];
+  fs.writeFileSync(SERVERS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+}
 
 function loadConfig() {
   try {
@@ -134,6 +151,50 @@ const server = http.createServer((req, res) => {
     const ledger = readLedger();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, node: cfg.node, peers: cfg.peers || [], recentLedger: ledger, token: cfg.token }));
+    return;
+  }
+
+  // 1.5 服务器资产查询与管理
+  if (url.pathname === '/api/servers' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, servers: loadServers() }));
+    return;
+  }
+
+  if (url.pathname === '/api/servers' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const current = loadServers();
+        const srv = {
+          id: data.id || `srv-${crypto.randomBytes(4).toString('hex')}`,
+          name: data.name || data.host,
+          host: data.host || '',
+          port: Number(data.port || 22),
+          user: data.user || 'root',
+          role: data.role || '服务器',
+          tags: Array.isArray(data.tags)
+            ? data.tags
+            : typeof data.tags === 'string'
+            ? data.tags.split(',').map((t) => t.trim()).filter(Boolean)
+            : [],
+          description: data.description || '',
+          source_peer: data.source_peer || 'local',
+          updated_at: new Date().toISOString(),
+        };
+        const idx = current.findIndex((s) => s.id === srv.id);
+        if (idx >= 0) current[idx] = srv;
+        else current.push(srv);
+        saveServers(current);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, server: srv, servers: current }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
     return;
   }
 
@@ -286,6 +347,31 @@ const server = http.createServer((req, res) => {
             if (r.ok) {
               const resData = await r.json();
               replyText = resData.reply || '【对端已成功接收并纳入处理】';
+              if (
+                resData.payload &&
+                resData.payload.kind === 'servers' &&
+                Array.isArray(resData.payload.items) &&
+                resData.payload.items.length > 0
+              ) {
+                const current = loadServers();
+                let added = 0;
+                for (const item of resData.payload.items) {
+                  const exists = current.find(
+                    (s) => s.host === item.host && Number(s.port || 22) === Number(item.port || 22)
+                  );
+                  if (!exists) {
+                    current.push({
+                      ...item,
+                      id: item.id || `srv-${crypto.randomBytes(4).toString('hex')}`,
+                      source_peer: targetPeer.name || 'remote',
+                      synced_at: new Date().toISOString(),
+                    });
+                    added++;
+                  }
+                }
+                saveServers(current);
+                replyText += `\n\n📥【自动资产同步】已将对端回传的 ${resData.payload.items.length} 项服务器资产合并入本地档案 (~/.dsh/peer-link/servers.json)！`;
+              }
             } else {
               replyText = `【投递状态: HTTP ${r.status}】`;
             }
@@ -737,7 +823,12 @@ ${replyText}
             <span>发信通道:</span>
             <span class="badge-tag badge-human" style="font-size:11px; padding:2px 8px; font-weight:600;">👤 人类控制台专属直连 (Human Path)</span>
           </div>
-          <span style="font-size:11px; color:#6e7681;">按 Enter 发送人类指令</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span style="font-size:11px; color:#8b949e;">⚡️ 快捷意图:</span>
+            <button class="tab-btn" style="font-size:11px; padding:2px 8px; border:1px solid #30363d;" onclick="fillPreset('sync_servers')">🖥 同步服务器</button>
+            <button class="tab-btn" style="font-size:11px; padding:2px 8px; border:1px solid #30363d;" onclick="fillPreset('query_system')">💻 系统环境</button>
+            <button class="tab-btn" style="font-size:11px; padding:2px 8px; border:1px solid #30363d;" onclick="fillPreset('query_tasks')">📋 任务进度</button>
+          </div>
         </div>
         <div class="input-row">
           <input class="topic-input" id="inputTopic" placeholder="议题 (如: API数据模型确认)">
@@ -910,6 +1001,22 @@ ${replyText}
       } catch (e) {
         console.error(e);
       }
+    }
+
+    function fillPreset(type) {
+      const t = document.getElementById('inputTopic');
+      const m = document.getElementById('inputMsg');
+      if (type === 'sync_servers') {
+        t.value = '服务器资产同步';
+        m.value = '请同步你本地已登记的所有服务器资产清单与连接配置。';
+      } else if (type === 'query_system') {
+        t.value = '系统环境指标查询';
+        m.value = '查询对端主机硬件架构、内存状态以及 Node 运行时环境。';
+      } else if (type === 'query_tasks') {
+        t.value = '协同任务与进展核对';
+        m.value = '核对对端当前正在进行的协作任务与近期流水账本。';
+      }
+      m.focus();
     }
 
     function escapeHtml(str) {
