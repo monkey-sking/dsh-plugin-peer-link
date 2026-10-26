@@ -3,6 +3,10 @@
 [![Powered by DSH](https://img.shields.io/badge/Powered%20by-DSH-blue?style=flat-square)](https://github.com/monkey-sking)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+<!-- badges:start -->
+[![Last commit](https://img.shields.io/github/last-commit/monkey-sking/dsh-plugin-peer-link?style=flat-square)](https://github.com/monkey-sking/dsh-plugin-peer-link/commits/main) [![JavaScript](https://img.shields.io/github/languages/top/monkey-sking/dsh-plugin-peer-link?style=flat-square)](https://github.com/monkey-sking/dsh-plugin-peer-link/search?l=JavaScript) [![Release](https://img.shields.io/github/v/release/monkey-sking/dsh-plugin-peer-link?style=flat-square)](https://github.com/monkey-sking/dsh-plugin-peer-link/releases) [![views](https://hits.sh/github.com/monkey-sking/dsh-plugin-peer-link.svg?style=flat-square&label=views&color=0e75b6)](https://github.com/monkey-sking/dsh-plugin-peer-link)
+<!-- badges:end -->
+
 跨电脑 DeepSeek Harness (DSH) 实例之间的**零配置局域网自动发现、对等协同与双端实时留痕**插件。
 
 ---
