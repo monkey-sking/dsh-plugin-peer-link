@@ -85,18 +85,23 @@ dsh plugin install ./dsh-plugin-peer-link-1.0.4.tgz
   },
   "listen_port": 8765,
   "radar_port": 8764,
-  "token": "dsh-peer-secret-shared-token",
+  "token": "<首次启动自动生成的 64 位随机十六进制串>",
   "peers": [
     {
       "name": "Ubuntu-Server-Backend",
       "avatar": "🐧",
       "role": "后端与分布式计算专家",
       "url": "http://192.168.1.100:8765",
-      "token": "dsh-peer-secret-shared-token"
+      "token": "<与对端 config.json 中的 token 保持一致>"
     }
   ]
 }
 ```
+
+> ⚠️ **不要沿用任何示例里的 token 字面量。** 首次启动会调用
+> `crypto.randomBytes(32).toString('hex')` 生成随机 token 并写入本文件；
+> 旧版本硬编码的 `dsh-peer-secret-shared-token` 在启动时会被自动识别并**轮换**。
+> 查看当前值：`jq -r .token ~/.dsh/peer-link/config.json`。
 *(跨公网/远程协作时，可配合 Tailscale / ZeroTier 填入虚拟内网 IP)*
 
 ---
@@ -107,11 +112,14 @@ dsh plugin install ./dsh-plugin-peer-link-1.0.4.tgz
 | --- | --- | --- |
 | `GET /health` | 无 | 仅返回节点名片与端口，供连通性探测 |
 | `POST /talk` | 请求体 `token` 必须匹配 | 缺 token 或 token 错误一律 401 |
-| `/api/*`（控制面） | 本机回环 + 同源或 `x-peer-token` | 外部网页即使跨源发起也拿不到响应 |
+| `/api/*`（控制面） | 本机回环 + 白名单 `Origin` + `x-peer-token` | 三者缺一不可 |
 
 - 控制面接口强制校验 `Origin`：浏览器从外部网页发起的请求，`remoteAddress` 同样是 `127.0.0.1`，只靠 IP 无法防 CSRF，因此必须看来源；
+- **但 `Origin` 只证明“请求来自哪里”，不能替代“请求者是谁”**：同源页面免 token 会让任意本机网页通过 CSRF 调用 `/api/profile` 改 token、`/api/human/send` 代发消息。因此还必须有 `x-peer-token`；
+- 控制面默认只监听 `127.0.0.1`。需要局域网访问时显式设置 `PEER_LINK_BIND=0.0.0.0`（插件侧对应 `DSH_PEER_ALLOW_PUBLIC=1`），并接受“仅靠共享 token 保护”的风险；
 - `/api/status` **不再返回明文 token**，只返回 `tokenConfigured: boolean`；
 - 所有入站字段（节点名、角色、头像、主题）在仪表盘渲染前统一 HTML 转义，防止恶意节点注入脚本；
+- 对端 URL 在**入库前**和**出站前**各校验一次：拒绝非 `http(s)`、内嵌凭据、`0.0.0.0/8`、`169.254.0.0/16`（云元数据）、回环与链路本地地址，防 SSRF；
 - 请求体上限 1MB，雷达与入站事件合并写盘，会话与流水文件自动滚动，避免长期运行撑爆磁盘。
 
 ---

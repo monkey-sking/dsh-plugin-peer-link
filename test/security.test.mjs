@@ -129,11 +129,78 @@ test('/api/status 拒绝跨源读取且不回显 CORS 头', async () => {
   assert.equal(res.headers['access-control-allow-origin'], undefined);
 });
 
-test('/api/status 允许本机回环来源并回显 CORS', async () => {
+test('/api/status 只凭本机回环 Origin 不再放行（A1 免 token 后门已关闭）', async () => {
+  // 这是 A1 的核心回归：旧实现 `if (origin) { ...; return true; }` 让任何同源/回环
+  // 来源的页面免 token 调所有写接口。现在 Origin 只证明“来源”，不能替代“身份”。
   const origin = 'http://127.0.0.1:52800';
   const res = await request('/api/status', { headers: { Origin: origin } });
+  assert.equal(res.status, 401);
+  assert.equal(res.headers['access-control-allow-origin'], origin, '白名单来源仍应拿到 CORS 头（前端才读得到 401）');
+});
+
+test('/api/status 回环来源 + 共享 token 才放行，并回显 CORS', async () => {
+  const origin = 'http://127.0.0.1:52800';
+  const res = await request('/api/status', { headers: { ...auth, Origin: origin } });
   assert.equal(res.status, 200);
   assert.equal(res.headers['access-control-allow-origin'], origin);
+  assert.equal(res.headers.vary.includes('Origin'), true);
+});
+
+test('同网段直连 IP 换 Origin（DNS-rebinding 场景）拿不到数据', async () => {
+  // 监听已收敛到回环，所以本用例在回环上模拟“Host 被改成局域网 IP”的 rebinding 请求：
+  // Host 来自攻击者控制的域名解析结果，Origin 与之同源 => 旧实现直接放行且免 token。
+  const res = await request('/api/status', {
+    headers: { Host: '192.168.1.23:18801', Origin: 'http://192.168.1.23:18801' },
+  });
+  assert.equal(res.status, 401, '同源判定通过但没有 token，仍必须 401');
+});
+
+test('控制面拒绝 query 参数里夹带的 token（防地址栏/Referer 泄露）', async () => {
+  const res = await request(`/api/status?token=${encodeURIComponent(TOKEN)}`);
+  assert.equal(res.status, 401);
+});
+
+test('/api/session-token 用共享 token 换控制面凭据，且不回显 token 明文', async () => {
+  const origin = 'http://127.0.0.1:52800';
+  const wrong = await request('/api/session-token', {
+    method: 'POST', headers: { Origin: origin }, body: { token: 'nope-nope-nope-nope' },
+  });
+  assert.equal(wrong.status, 401);
+
+  const ok = await request('/api/session-token', {
+    method: 'POST', headers: { ...auth, Origin: origin }, body: { token: TOKEN },
+  });
+  assert.equal(ok.status, 200);
+  assert.ok(typeof ok.json.credential === 'string' && ok.json.credential.length >= 32);
+  assert.equal(ok.body.includes(TOKEN), false, '凭据不得等于/包含共享 token');
+
+  // 派生凭据可用于同源页面访问
+  const status = await request('/api/status', {
+    headers: { 'x-peer-token': ok.json.credential, Origin: origin },
+  });
+  assert.equal(status.status, 200);
+
+  // 但换一个 Origin（跨源）时派生凭据无效：它绑定“浏览器页面”这一前提
+  const cross = await request('/api/status', {
+    headers: { 'x-peer-token': ok.json.credential, Origin: 'https://evil.example' },
+  });
+  assert.equal(cross.status, 403);
+});
+
+test('仪表盘前端所有控制面 fetch 都带鉴权头（A2 回归）', async () => {
+  const res = await request('/', { headers: auth });
+  assert.equal(res.status, 200);
+  // 除 /api/session-token（它就是拿 token 换凭据的那一次）以外，
+  // 不允许出现裸 fetch('/api/...')
+  assert.equal(
+    [...res.body.matchAll(/fetch\('\/api\/session-token'/g)].length,
+    1,
+    '只应有 apiFetch 内部那一处 /api/session-token 请求'
+  );
+  for (const ep of ['/api/status', '/api/scan', '/api/ping', '/api/profile', '/api/send', '/api/peers']) {
+    assert.ok(res.body.includes(`apiFetch('${ep}`), `${ep} 必须走 apiFetch 带鉴权头`);
+  }
+  assert.equal(res.body.includes('window.__PEER_TOKEN__'), false, '不应把凭据注入 HTML');
 });
 
 test('控制面写接口拒绝无凭据的局域网写入', async () => {

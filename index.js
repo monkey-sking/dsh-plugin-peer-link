@@ -78,12 +78,123 @@ const ONLINE_TTL_MS = 60 * 1000;               // 心跳 15s，超过 60s 未更
 const MAX_LEDGER_LINES = 2000;                 // ledger.jsonl 滚动保留行数
 const MAX_SESSION_FILES = 500;                 // sessions/*.md 保留数量
 const MAX_PORT_FALLBACKS = 10;                 // 端口回退上限，避免无限递归
+// 历史版本硬编码在源码里的“共享密钥”。仓库是 public，这些值等同公开密码，
+// 配置里出现时必须轮换成随机密钥。
+const LEGACY_PUBLIC_TOKENS = new Set(['dsh-peer-secret-shared-token']);
 
 // 判断请求是否来自本机回环（控制面接口的唯一可信来源）
 function isLoopbackRequest(req) {
   const addr = req.socket?.remoteAddress || '';
   const normalized = addr.replace(/^::ffff:/, '');
   return normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost';
+}
+
+// 控制面默认只监听回环。需要局域网访问时必须显式开启，
+// 且知道共享 token 的任意一个邻居就能读写整个控制面。
+// 旧版无条件 listen('0.0.0.0')，配合“同源即免 token”等于把控制面裸奔在局域网。
+function isControlPlanePublic() {
+  const v = String(process.env.DSH_PEER_ALLOW_PUBLIC || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+// 生成高强度共享密钥。绝不允许回退到硬编码常量（public 仓库 = 公开密钥）
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function isValidToken(v) {
+  return typeof v === 'string' && v.trim().length >= 16;
+}
+
+// 从请求中提取共享密钥带来的凭据。
+// 只看自定义头：跨源网页在 CORS 预检被拒的情况下根本发不出带自定义头的请求，
+// 而 query 参数一旦出现在地址栏/Referer/日志里就等于泄露密钥。
+function extractProvidedToken(req) {
+  const h = req.headers['x-peer-token'];
+  if (typeof h === 'string' && h.length > 0) return h;
+  return null;
+}
+
+// IPv4 点分十进制转 32 位整数；非法返回 null
+function ipv4ToInt(ip) {
+  const parts = String(ip).split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    const v = Number(p);
+    if (v > 255) return null;
+    n = (n << 8) | v;
+  }
+  return n >>> 0;
+}
+
+function isLoopbackHost(host) {
+  const h = String(host || '').replace(/^\[|\]$/g, '').toLowerCase();
+  // 'localhost' 可被 /etc/hosts 篡改成任意地址，不能当回环采信
+  return h === '127.0.0.1' || h === '::1';
+}
+
+function classifyPeerHost(host) {
+  const h = String(host || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!h) return 'forbidden';
+  if (isLoopbackHost(h)) return 'loopback';
+  const v4 = ipv4ToInt(h);
+  if (v4 !== null) {
+    if ((v4 >>> 24) === 0) return 'forbidden';                              // 0.0.0.0/8
+    if ((v4 >>> 24) === 127) return h === '127.0.0.1' ? 'loopback' : 'forbidden';
+    if ((v4 >>> 16) === 0xa9fe) return 'forbidden';                          // 169.254.0.0/16 链路本地 / 云元数据
+    if ((v4 & 0xffff0000) === 0xc0a80000) return 'private';                  // 192.168.0.0/16
+    if ((v4 & 0xfff00000) === 0xac100000) return 'private';                  // 172.16.0.0/12
+    if ((v4 & 0xff000000) === 0x0a000000) return 'private';                  // 10.0.0.0/8
+    if ((v4 & 0xff000000) === 0x64400000) return 'private';                  // 100.64.0.0/10 (CGNAT / Tailscale 100.x)
+    return 'public';
+  }
+  if (h === '::') return 'forbidden';
+  if (h.startsWith('fe80')) return 'forbidden';                               // IPv6 链路本地
+  if (h.startsWith('fc') || h.startsWith('fd')) return 'private';            // IPv6 ULA
+  if (/^[0-9.]+$/.test(h)) return 'forbidden';                               // 畸形 IPv4
+  return 'public';                                                          // DNS 名（主机名 / MagicDNS 等）
+}
+
+// SSRF 防线：对端 URL 来自远端 announce 包，必须校验后才能被服务端 fetch/ping。
+// 拒绝：非 http(s)、带用户名密码、0.0.0.0/链路本地元数据地址、非回环的 127.x。
+// 默认拒绝本机回环与 DNS 名（同一台机器上用 127.0.0.1 对等 / 用域名访问时需要显式开启）。
+function validatePeerUrl(raw, { myPort = 0, allowLoopback = false, allowHostname = false } = {}) {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2048) {
+    return { ok: false, error: '对端 URL 缺失或过长' };
+  }
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    return { ok: false, error: '对端 URL 无法解析' };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { ok: false, error: '对端 URL 只允许 http/https' };
+  }
+  if (u.username || u.password) {
+    return { ok: false, error: '对端 URL 不允许内嵌用户名密码' };
+  }
+  const kind = classifyPeerHost(u.hostname);
+  if (kind === 'forbidden') {
+    return { ok: false, error: '对端 URL 指向禁止的地址（链路本地/元数据/广播/畸形 IP）' };
+  }
+  if (kind === 'loopback') {
+    if (!allowLoopback) {
+      return { ok: false, error: '对端 URL 指向本机回环，如需本机自测请设置 DSH_PEER_ALLOW_LOOPBACK_PEER=1' };
+    }
+    // 回环 + 本机监听端口 = 指向自己，会形成自问自答的假留痕
+    if (Number(u.port || 80) === Number(myPort)) {
+      return { ok: false, error: '对端 URL 指向本机自身端口' };
+    }
+  }
+  if (kind === 'public' && ipv4ToInt(u.hostname) === null && !isLoopbackHost(u.hostname)) {
+    if (!allowHostname) {
+      return { ok: false, error: '对端 URL 使用域名，如确需请设置 DSH_PEER_ALLOW_HOSTNAME_PEER=1' };
+    }
+  }
+  return { ok: true, normalized: u.toString().replace(/\/+$/, '') };
 }
 
 // 同源/CORS 白名单：只允许“本机回环”或“与请求 Host 同源”的来源。
@@ -140,7 +251,9 @@ function loadConfig() {
     // 雷达 UDP 端口。同一台机器同时跑多个实例时必须各用一个，
     // 因为 reuseAddr 会让同端口的多个 socket 互相争抢数据包。
     radar_port: parseInt(process.env.DSH_PEER_RADAR_PORT || '8764', 10),
-    token: process.env.DSH_PEER_TOKEN || 'dsh-peer-secret-shared-token',
+    // 出厂密钥随机生成。旧版兜底写死 'dsh-peer-secret-shared-token'，
+    // 而本仓库是 public 仓库 —— 那个常量等于公开密钥，任何人可凭它调 /talk 和控制面。
+    token: process.env.DSH_PEER_TOKEN || generateToken(),
     // 出厂通讯录为空：绝不预置指向 127.0.0.1 的“假对端”，
     // 否则 peer_talk 不传 target 时会取 peers[0] 变成自问自答并伪造审计留痕。
     peers: []
@@ -171,7 +284,8 @@ function loadConfig() {
           avatar: '🖥',
           role: '对等节点',
           url: parsed.peer_url,
-          token: parsed.token || 'dsh-peer-secret-shared-token',
+          // 旧版在这里把公开仓库里的硬编码常量当成对端密钥
+          token: parsed.token || defaultConf.token,
           online: false,
           latencyMs: null,
           last_seen: null,
@@ -192,6 +306,10 @@ function loadConfig() {
           return true;
         }
       });
+    }
+    // 旧配置里若是历史硬编码密钥，直接轮换成随机密钥并落盘，不再对外宣称一个公开值
+    if (typeof parsed.token !== 'string' || parsed.token.length === 0 || LEGACY_PUBLIC_TOKENS.has(parsed.token)) {
+      parsed.token = defaultConf.token;
     }
     return { ...defaultConf, ...parsed, node: { ...defaultConf.node, ...(parsed.node || {}) } };
   } catch {
@@ -678,7 +796,17 @@ async function postJson(url, data, timeoutMs = 20000) {
 
 async function pingPeer(cfg, targetPeer) {
   const start = Date.now();
-  const targetUrl = `${targetPeer.url.replace(/\/+$/, '')}/health`;
+  // SSRF 防线：targetPeer.url 可能来自远端 announce 包或旧配置，出站前必须校验，
+  // 否则 /api/ping 等于把本机变成访问内网元数据（169.254.169.254）的代理。
+  const check = validatePeerUrl(targetPeer.url, {
+    myPort: cfg.listen_port,
+    allowLoopback: String(process.env.DSH_PEER_ALLOW_LOOPBACK_PEER || '') === '1',
+    allowHostname: String(process.env.DSH_PEER_ALLOW_HOSTNAME_PEER || '') === '1',
+  });
+  if (!check.ok) {
+    return { ok: false, error: `拒绝探测不安全的目标地址: ${check.error}` };
+  }
+  const targetUrl = `${check.normalized}/health`;
   try {
     const parsed = new URL(targetUrl);
     const resp = await new Promise((resolve, reject) => {
@@ -731,6 +859,20 @@ export function apply(ctx) {
   let server = null;
   let activePort = cfg.listen_port;
   let radar = null;
+
+  // 控制面鉴权凭据缓存：key = `${当前 token}:${端口}`。
+  // 令牌变更（改 token）或端口回退时自动失效，不会出现“旧令牌继续可用”。
+  let controlCredCache = { key: null, value: null };
+  function getControlCredential() {
+    const key = `${cfg.token}:${activePort}`;
+    if (controlCredCache.key === key && controlCredCache.value) return controlCredCache.value;
+    const value = crypto
+      .createHmac('sha256', String(cfg.token || ''))
+      .update(`dsh-plugin-peer-link/control-plane/v1|${activePort}`)
+      .digest('base64url');
+    controlCredCache = { key, value };
+    return value;
+  }
 
   // 1. 启动本地监听服务
   function renderDashboardHtml() {
@@ -919,6 +1061,41 @@ export function apply(ctx) {
   </div>
 
   <script>
+    // 控制面凭据：不再由 HTML 注入（注入需要把派生凭据写进页面源码，
+    // 而页面本身是 / 这一裸路由，任何能打开 127.0.0.1:<port>/ 的进程都能读到）。
+    // 改为页面首次加载时用共享 token 换取会话凭据，只存在 JS 内存里，不落 cookie/localStorage。
+    let CONTROL_CRED = '';
+
+    async function ensureCred() {
+      if (CONTROL_CRED) return CONTROL_CRED;
+      let token = '';
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        token = prompt('请输入本机 Peer Link 共享 token（见 ~/.dsh/peer-link/config.json）') || '';
+        if (!token) throw new Error('未提供共享 token，控制面已锁定');
+        const res = await fetch('/api/session-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token })
+        });
+        if (res.ok) {
+          const d = await res.json();
+          CONTROL_CRED = d.credential || '';
+          if (CONTROL_CRED) return CONTROL_CRED;
+        }
+        alert('token 不正确，请重试');
+      }
+      throw new Error('鉴权失败');
+    }
+
+    // 所有控制面请求统一走这里，自动带 x-peer-token
+    async function apiFetch(url, options = {}) {
+      const cred = await ensureCred();
+      const headers = Object.assign({}, options.headers || {}, { 'x-peer-token': cred });
+      const res = await fetch(url, Object.assign({}, options, { headers }));
+      if (res.status === 401 || res.status === 403) CONTROL_CRED = '';
+      return res;
+    }
+
     // 统一转义：所有来自远端（announce 包 / 入站消息）的字段都不可信
     function esc(v) {
       return String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({
@@ -932,7 +1109,7 @@ export function apply(ctx) {
 
     async function loadData() {
       try {
-        const res = await fetch('/api/status');
+        const res = await apiFetch('/api/status');
         const data = await res.json();
         if (!data.ok) return;
 
@@ -1003,14 +1180,14 @@ export function apply(ctx) {
 
     async function scanRadar() {
       try {
-        await fetch('/api/scan', { method: 'POST' });
+        await apiFetch('/api/scan', { method: 'POST' });
         setTimeout(loadData, 700);
       } catch (e) { alert(e.message); }
     }
 
     async function pingPeer(peerId) {
       try {
-        const res = await fetch('/api/ping', {
+        const res = await apiFetch('/api/ping', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ peerId })
@@ -1023,7 +1200,7 @@ export function apply(ctx) {
 
     async function saveMyProfile() {
       try {
-        await fetch('/api/profile', {
+        await apiFetch('/api/profile', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1047,7 +1224,7 @@ export function apply(ctx) {
       if (!topic || !message) return alert('请填写主题和内容');
 
       try {
-        const res = await fetch('/api/send', {
+        const res = await apiFetch('/api/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ topic, message, target, asHuman: true })
@@ -1069,7 +1246,7 @@ export function apply(ctx) {
       if (!name) return;
       const url = prompt('请输入对端 URL (例如 http://192.168.1.100:8765):');
       if (!url) return;
-      await fetch('/api/peers', {
+      await apiFetch('/api/peers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, url })
@@ -1103,11 +1280,16 @@ export function apply(ctx) {
     });
   }
 
-  // 控制面鉴权：本机回环 + 来源校验。
+  // 控制面鉴权：本机回环 + 来源校验 + **凭据校验**。
   // 关键：浏览器发起的请求即使来自外部网页，socket.remoteAddress 也是 127.0.0.1，
   // 所以必须靠 Origin 判断，否则任意网页都能 CSRF 改配置/读通讯录。
-  // - Origin 存在：仅接受本机回环来源（DSH Web GUI / 控制台自身）
-  // - Origin 缺失：非浏览器调用（curl / agent 工具），要求共享 token
+  // 但 Origin 只是“来源”而不是“身份”——旧版 `if (origin) { ...; return true; }`
+  // 让任何同源/回环来源的页面（含 DNS-rebinding 的 http://<局域网IP>:8765）免 token
+  // 调所有写接口。现在两者都必须要：
+  // - Origin 存在：必须是本机回环来源或与请求 Host 同源，否则 403；
+  // - 凭据：x-peer-token 头，值可以是共享 token，或服务端用 token 派生的
+  //   “控制面凭据”（注入给本机仪表盘页面，见 renderDashboardHtml）。
+  //   没有 Origin 的非浏览器调用（curl / agent 工具）只能使用共享 token。
   function authorizeControlPlane(req, res, reqUrl) {
     if (!isLoopbackRequest(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -1121,18 +1303,32 @@ export function apply(ctx) {
         res.end(JSON.stringify({ ok: false, error: '跨源访问被拒绝' }));
         return false;
       }
-      return true;
     }
-    const provided = req.headers['x-peer-token'] || reqUrl.searchParams.get('token');
-    if (!provided || !safeEqual(provided, cfg.token)) {
+    const provided = extractProvidedToken(req);
+    if (!provided) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: '缺少或错误的 x-peer-token' }));
+      res.end(JSON.stringify({ ok: false, error: '缺少 x-peer-token' }));
+      return false;
+    }
+    const expected = String(cfg.token || '');
+    if (!expected) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '本机未配置共享 token，控制面已锁定' }));
+      return false;
+    }
+    // 恒定时间比较：共享 token，或（仅限浏览器同源/回环页面）控制面派生凭据
+    const byShared = safeEqual(provided, expected);
+    const byDerived = Boolean(origin) && safeEqual(provided, getControlCredential());
+    if (!byShared && !byDerived) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'x-peer-token 不正确' }));
       return false;
     }
     return true;
   }
 
   function startHttpServer(port, attempt = 0) {
+    const bindAddress = isControlPlanePublic() ? '0.0.0.0' : '127.0.0.1';
     // CORS 白名单：只回显本机回环来源；无 Origin（同源/curl）不放行跨域头
     const srv = http.createServer(async (req, res) => {
       const reqOrigin = req.headers.origin;
@@ -1142,6 +1338,10 @@ export function apply(ctx) {
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-peer-token');
       }
+      // 强制 MIME 嗅探防护：仪表盘是内联脚本页，被嗅探成其他类型只会放大风险
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'no-referrer');
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -1163,6 +1363,16 @@ export function apply(ctx) {
             time: new Date().toISOString(),
           })
         );
+        return;
+      }
+
+      // Web 前端 API: 用共享 token 换取“控制面凭据”（仪表盘页面用）。
+      // 这是唯一接受共享 token 的浏览器入口，所以只做一件事：鉴权通过就发一个派生凭据。
+      // 返回的是用 token 派生的 HMAC 值，拿不到 token 明文，也拿不到 /talk 的入站资格。
+      if (req.method === 'POST' && reqUrl.pathname === '/api/session-token') {
+        if (!authorizeControlPlane(req, res, reqUrl)) return;
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, credential: getControlCredential() }));
         return;
       }
 
@@ -1193,8 +1403,15 @@ export function apply(ctx) {
             if (data.name) cfg.node.name = data.name;
             if (data.avatar) cfg.node.avatar = data.avatar;
             if (data.role) cfg.node.role = data.role;
-            if (data.token !== undefined) cfg.token = data.token;
+            // 改 token 必须校验强度：空串/短串会让 /talk 与雷达一起失效或被弱口令猜中。
+            // 旧版 `if (data.token !== undefined) cfg.token = data.token` 允许直接把 token 改成 ''。
+            if (data.token !== undefined) {
+              if (data.token === null || data.token === '') throw new Error('token 不允许置空；如需更换请提供新值');
+              if (!isValidToken(data.token)) throw new Error('token 强度不足：至少 16 个字符');
+              cfg.token = String(data.token);
+            }
             saveConfig(cfg);
+            cfg = loadConfig();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, node: cfg.node }));
           } catch (e) {
@@ -1212,7 +1429,14 @@ export function apply(ctx) {
           try {
             const data = JSON.parse(body || '{}');
             if (!data.url) throw new Error('缺少对端 URL');
-            upsertPeer(cfg, data);
+            // SSRF 防线：url 之后会被 /api/ping、/api/send 直接 fetch，必须先校验
+            const check = validatePeerUrl(data.url, {
+              myPort: activePort,
+              allowLoopback: String(process.env.DSH_PEER_ALLOW_LOOPBACK_PEER || '') === '1',
+              allowHostname: String(process.env.DSH_PEER_ALLOW_HOSTNAME_PEER || '') === '1',
+            });
+            if (!check.ok) throw new Error(check.error);
+            upsertPeer(cfg, { ...data, url: check.normalized });
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, peers: publicPeers(cfg) }));
           } catch (e) {
@@ -1342,7 +1566,14 @@ export function apply(ctx) {
               url: `http://${os.hostname()}:${activePort}`,
             };
 
-            const postUrl = `${target.url.replace(/\/+$/, '')}/talk`;
+            // SSRF 防线：目标 URL 可能来自远端 announce 包，投递前必须校验
+            const sendCheck = validatePeerUrl(target.url, {
+              myPort: activePort,
+              allowLoopback: String(process.env.DSH_PEER_ALLOW_LOOPBACK_PEER || '') === '1',
+              allowHostname: String(process.env.DSH_PEER_ALLOW_HOSTNAME_PEER || '') === '1',
+            });
+            if (!sendCheck.ok) throw new Error(`拒绝向不安全的目标地址投递: ${sendCheck.error}`);
+            const postUrl = `${sendCheck.normalized}/talk`;
             const resp = await postJson(postUrl, {
               trace_id: traceId,
               sender: senderEnvelope,
@@ -1467,25 +1698,13 @@ export function apply(ctx) {
             // 结果把访客记成了指向自己的对端（自问自答的根源）。
             // 现在只采信对端自己声明的 URL；没有就跳过，绝不臆造。
             if (senderObj.url) {
-              const remoteIp = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-              let learnUrl = null;
-              try {
-                const u = new URL(senderObj.url);
-                // 只接受 http(s)，且没有提供端口时补默认端口
-                if (u.protocol === 'http:' || u.protocol === 'https:') {
-                  learnUrl = u.toString().replace(/\/+$/, '');
-                }
-              } catch {}
-              // 防御：解析出的主机若就是本机回环且端口等于本机端口，说明是自指，丢弃
-              if (learnUrl) {
-                try {
-                  const lu = new URL(learnUrl);
-                  const isSelf =
-                    ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(lu.hostname) &&
-                    Number(lu.port || 80) === Number(activePort);
-                  if (isSelf) learnUrl = null;
-                } catch {}
-              }
+              // 只接受 http(s) 且通过 SSRF 校验的地址；senderObj.url 完全由对端控制
+              const learned = validatePeerUrl(senderObj.url, {
+                myPort: activePort,
+                allowLoopback: String(process.env.DSH_PEER_ALLOW_LOOPBACK_PEER || '') === '1',
+                allowHostname: String(process.env.DSH_PEER_ALLOW_HOSTNAME_PEER || '') === '1',
+              });
+              const learnUrl = learned.ok ? learned.normalized : null;
               if (learnUrl) {
                 upsertPeer(cfg, {
                   id: senderObj.id,
@@ -1560,7 +1779,11 @@ export function apply(ctx) {
         return;
       }
 
-      // 7. 独立 Web 控制台页面
+      // 7. 独立 Web 控制台页面。
+      // 这里**故意不鉴权**：它是浏览器取凭据的唯一入口（页面脚本用共享 token 换
+      // /api/session-token），锁掉就永远打不开。页面本身不含任何数据/凭据
+      // ——花名册、流水、token 状态全部来自鉴权后的 /api/status，页面脚本自动弹窗索要
+      // 共享 token。所以这里泄露的只有“本机 8765-8770 上跑着 peer-link”这一事实。
       if ((req.url === '/' || req.url === '/dashboard') && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(renderDashboardHtml());
@@ -1588,12 +1811,13 @@ export function apply(ctx) {
       }
     });
 
-    srv.listen(port, '0.0.0.0', () => {
+    srv.listen(port, bindAddress, () => {
       activePort = port;
+      // hostname 之前的对端回连里没带端口，现在明确带上，避免拼出 :80
       try {
         writeFileAtomic(
           path.join(PEER_DIR, 'active_port.json'),
-          JSON.stringify({ port: activePort, pid: process.pid, at: new Date().toISOString() })
+          JSON.stringify({ port: activePort, pid: process.pid, bind: bindAddress, at: new Date().toISOString() })
         );
       } catch {}
     });

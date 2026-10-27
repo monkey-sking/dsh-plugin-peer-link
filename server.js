@@ -5,11 +5,128 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 
 const PORT = 8790;
+// 默认只监听回环。局域网访问必须显式开启（PEER_LINK_BIND=0.0.0.0 或具体网卡地址），
+// 因为知道共享 token 的任意邻居都能通过这个控制台以“人类身份”向外发信。
+const BIND = String(process.env.PEER_LINK_BIND || '127.0.0.1').trim() || '127.0.0.1';
 const PEER_DIR = path.join(os.homedir(), '.dsh', 'peer-link');
 const SESSIONS_DIR = path.join(PEER_DIR, 'sessions');
 const CONFIG_FILE = path.join(PEER_DIR, 'config.json');
 const LEDGER_FILE = path.join(PEER_DIR, 'ledger.jsonl');
 const SERVERS_FILE = path.join(PEER_DIR, 'servers.json');
+const MAX_BODY_BYTES = 1024 * 1024;
+
+// 历史版本硬编码的“共享密钥”。仓库是 public，这个值等同公开密码，必须轮换。
+const LEGACY_PUBLIC_TOKENS = new Set(['dsh-peer-secret-shared-token']);
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function isLoopbackRequest(req) {
+  const addr = (req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  return addr === '127.0.0.1' || addr === '::1';
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+function isSameOriginAsRequest(req, origin) {
+  if (!origin) return false;
+  try {
+    return new URL(origin).host === (req.headers.host || '');
+  } catch {
+    return false;
+  }
+}
+
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a ?? ''), 'utf-8');
+  const bb = Buffer.from(String(b ?? ''), 'utf-8');
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function ipv4ToInt(ip) {
+  const parts = String(ip).split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    const v = Number(p);
+    if (v > 255) return null;
+    n = (n << 8) | v;
+  }
+  return n >>> 0;
+}
+
+// 对端 URL 来自远端 announce 包，服务端会拿它 fetch，必须挡住 SSRF：
+// 拒绝非 http(s)、带凭据、0.0.0.0/8、169.254.0.0/16（云元数据）、127.x 非本号、IPv6 链路本地。
+function validatePeerUrl(raw) {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2048) {
+    return { ok: false, error: '对端 URL 缺失或过长' };
+  }
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    return { ok: false, error: '对端 URL 无法解析' };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { ok: false, error: '对端 URL 只允许 http/https' };
+  }
+  if (u.username || u.password) {
+    return { ok: false, error: '对端 URL 不允许内嵌用户名密码' };
+  }
+  const host = String(u.hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+  const v4 = ipv4ToInt(host);
+  if (v4 !== null) {
+    if ((v4 >>> 24) === 0) return { ok: false, error: '禁止 0.0.0.0/8 地址' };
+    if ((v4 >>> 16) === 0xa9fe) return { ok: false, error: '禁止链路本地/云元数据地址 169.254.0.0/16' };
+    if ((v4 >>> 24) === 127) return { ok: false, error: '禁止回环地址' };
+  } else if (host === '::1' || host === '::' || host.startsWith('fe80')) {
+    return { ok: false, error: '禁止回环/链路本地地址' };
+  } else if (host === 'localhost') {
+    return { ok: false, error: '禁止 localhost' };
+  }
+  return { ok: true, normalized: u.toString().replace(/\/+$/, '') };
+}
+
+function loadConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+    // 旧配置里若是历史公开常量，同样轮换并落盘
+    if (typeof cfg.token !== 'string' || cfg.token.length === 0 || LEGACY_PUBLIC_TOKENS.has(cfg.token)) {
+      cfg.token = generateToken();
+      try {
+        fs.mkdirSync(PEER_DIR, { recursive: true });
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+      } catch {}
+    }
+    return cfg;
+  } catch {
+    // 不再回退到硬编码密钥：随机生成一份并落盘，保证控制台与插件使用同一个值
+    const cfg = {
+      node: { id: 'node-local', name: 'MacBook-Pro-Frontend', avatar: '🧠', role: '前端与移动端架构专家' },
+      listen_port: 8765,
+      radar_port: 8764,
+      token: generateToken(),
+      peers: []
+    };
+    try {
+      fs.mkdirSync(PEER_DIR, { recursive: true });
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+    } catch {}
+    return cfg;
+  }
+}
 
 // 本机局域网地址。之前这里是硬编码的开发机内网 IP，
 // 换台机器就会把对端回连到别人的内网 IP 上，既不通也泄露开发机网段。
@@ -41,19 +158,6 @@ function loadServers() {
 function saveServers(servers) {
   const list = Array.isArray(servers) ? servers : [];
   fs.writeFileSync(SERVERS_FILE, JSON.stringify(list, null, 2), 'utf-8');
-}
-
-function loadConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
-  } catch {
-    return {
-      node: { id: 'node-local', name: 'MacBook-Pro-Frontend', avatar: '🧠', role: '前端与移动端架构专家' },
-      listen_port: 8765,
-      token: 'dsh-peer-secret-shared-token',
-      peers: []
-    };
-  }
 }
 
 function saveConfig(cfg) {
@@ -148,12 +252,73 @@ function parseAllChatMessages() {
   return messages.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
 }
 
+// 控制面鉴权：回环 + 同源/回环来源白名单 + 共享 token（x-peer-token）。
+// 旧版三条都没有：监听 0.0.0.0、ACAO:*、所有 /api/* 裸奔，同网段任何人可读流水、
+// 改 token、改花名册，并通过 /api/human/send 以“人类身份”向外发信。
+function authorizeApi(req, res) {
+  if (!isLoopbackRequest(req)) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: '控制台接口仅允许本机访问（如需局域网请显式设置 PEER_LINK_BIND）' }));
+    return false;
+  }
+  const origin = req.headers.origin;
+  if (origin && !isAllowedOrigin(origin) && !isSameOriginAsRequest(req, origin)) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: '跨源访问被拒绝' }));
+    return false;
+  }
+  const cfg = loadConfig();
+  const provided = req.headers['x-peer-token'];
+  if (!cfg.token || typeof provided !== 'string' || !safeEqual(provided, cfg.token)) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: '缺少或错误的 x-peer-token' }));
+    return false;
+  }
+  return true;
+}
+
+// 读取请求体并强制大小上限（旧版是裸 req.on('data') 无上限，可一次打爆内存）
+function readJsonBody(req, res, onDone) {
+  let body = '';
+  let aborted = false;
+  req.on('data', (c) => {
+    if (aborted) return;
+    body += c;
+    if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
+      aborted = true;
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: `请求体超过 ${MAX_BODY_BYTES} 字节上限` }));
+      req.destroy();
+    }
+  });
+  req.on('end', () => {
+    if (!aborted) onDone(body);
+  });
+}
+
 const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // CORS 白名单：只回显本机回环来源；其余一律不发跨域头。
+  // 旧版 `ACAO: *` 且 Allow-Headers 只有 Content-Type —— 即便加了 token 头，
+  // 浏览器预检也会因为没放行 x-peer-token 而拒绝。两处必须一起改。
+  const reqOrigin = req.headers.origin;
+  if (isAllowedOrigin(reqOrigin)) {
+    res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-peer-token');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
 
   if (req.method === 'OPTIONS') {
+    // 预检只对白名单来源放行；跨源预检直接 403，浏览器会拒绝后续真实请求
+    if (!isAllowedOrigin(reqOrigin)) {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
     res.writeHead(204);
     res.end();
     return;
@@ -161,12 +326,17 @@ const server = http.createServer((req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
+  // 所有 /api/* 一律先过鉴权（含 GET：旧版 GET 也是裸奔的）
+  if (url.pathname.startsWith('/api/') && !authorizeApi(req, res)) return;
+
   // 1. 基础状态
   if (url.pathname === '/api/status' && req.method === 'GET') {
     const cfg = loadConfig();
     const ledger = readLedger();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, node: cfg.node, peers: cfg.peers || [], recentLedger: ledger, token: cfg.token }));
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    // 旧版这里是 `token: cfg.token`：把明文共享密钥回传给任何调用方。
+    // 改成只暴露“是否已配置”。
+    res.end(JSON.stringify({ ok: true, node: cfg.node, peers: cfg.peers || [], recentLedger: ledger, tokenConfigured: Boolean(cfg.token) }));
     return;
   }
 
@@ -178,9 +348,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/servers' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
+    readJsonBody(req, res, (body) => {
       try {
         const data = JSON.parse(body || '{}');
         const current = loadServers();
@@ -228,16 +396,20 @@ const server = http.createServer((req, res) => {
 
   // 3. 修改档案
   if (url.pathname === '/api/profile' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
+    readJsonBody(req, res, (body) => {
       try {
         const d = JSON.parse(body);
         const cfg = loadConfig();
         if (d.name) cfg.node.name = d.name;
         if (d.avatar) cfg.node.avatar = d.avatar;
         if (d.role) cfg.node.role = d.role;
-        if (d.token !== undefined) cfg.token = d.token;
+        // 改 token 必须校验强度：旧版允许把 token 直接改成 ''（控制台随即对任何人开放）
+        if (d.token !== undefined) {
+          if (typeof d.token !== 'string' || d.token.trim().length < 16) {
+            throw new Error('token 强度不足：至少 16 个字符，且不允许置空');
+          }
+          cfg.token = d.token;
+        }
         saveConfig(cfg);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, node: cfg.node }));
@@ -251,19 +423,20 @@ const server = http.createServer((req, res) => {
 
   // 4. 添加对端
   if (url.pathname === '/api/peers' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
+    readJsonBody(req, res, (body) => {
       try {
         const d = JSON.parse(body);
         const cfg = loadConfig();
         cfg.peers = cfg.peers || [];
+        // SSRF 防线：这个 url 之后会被 /api/ping、/api/human/send 直接 fetch
+        const check = validatePeerUrl(d.url);
+        if (!check.ok) throw new Error(check.error);
         cfg.peers.push({
           id: `peer-${Date.now().toString(16)}`,
           name: d.name || '对等端',
           avatar: d.avatar || '🖥',
           role: d.role || '协作者',
-          url: d.url,
+          url: check.normalized,
           token: d.token || cfg.token,
           online: true,
           last_seen: new Date().toISOString()
@@ -281,17 +454,18 @@ const server = http.createServer((req, res) => {
 
   // 5. 节点探测
   if (url.pathname === '/api/ping' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', async () => {
+    readJsonBody(req, res, async (body) => {
       try {
         const { peerId } = JSON.parse(body);
         const cfg = loadConfig();
         const peer = (cfg.peers || []).find(p => p.id === peerId || p.url === peerId || p.name === peerId);
         if (!peer) throw new Error('未找到该对等节点');
 
+        // SSRF 防线：peer.url 可能来自远端 announce 包或旧配置
+        const check = validatePeerUrl(peer.url);
+        if (!check.ok) throw new Error(`拒绝探测不安全的目标地址: ${check.error}`);
         const start = Date.now();
-        const pingUrl = `${peer.url.replace(/\/+$/, '')}/health`;
+        const pingUrl = `${check.normalized}/health`;
         const r = await fetch(pingUrl, { signal: AbortSignal.timeout(1500) });
         const latency = Date.now() - start;
         peer.online = r.ok;
@@ -311,9 +485,7 @@ const server = http.createServer((req, res) => {
 
   // 6. 人类控制台专属发信端点（物理路径决定身份，强制 human）
   if ((url.pathname === '/api/human/send' || url.pathname === '/api/send') && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', async () => {
+    readJsonBody(req, res, async (body) => {
       try {
         const { topic, message, context, target } = JSON.parse(body);
         const cfg = loadConfig();
@@ -334,8 +506,11 @@ const server = http.createServer((req, res) => {
         // 如果配置了具体 URL，发起真实 HTTP 投递
         if (targetPeer && targetPeer.url) {
           try {
+            // SSRF 防线：targetPeer.url 来自远端 announce 包或手动登记，投递前必须校验
+            const dest = validatePeerUrl(targetPeer.url);
+            if (!dest.ok) throw new Error(`拒绝向不安全的目标地址投递: ${dest.error}`);
             const start = Date.now();
-            const postUrl = `${targetPeer.url.replace(/\/+$/, '')}/talk`;
+            const postUrl = `${dest.normalized}/talk`;
             const payload = {
               topic: topic || '聊天消息',
               message,
@@ -880,6 +1055,29 @@ ${replyText}
     let myNode = { name: 'MacBook-Pro-Frontend', avatar: '🧠', role: '前端架构' };
     let peers = [];
 
+    // 控制面共享密钥（x-peer-token）。
+    // 不写死在 HTML 里，也不放 localStorage：只存在当前标签页的 JS 内存中，
+    // 首次使用时弹窗输入（与服务端 ~/.dsh/peer-link/config.json 里的 token 一致）。
+    // 刷新页面需要重新输入，换取的是“页面源码/磁盘缓存里没有长期凭据”。
+    let PEER_TOKEN = '';
+    function ensureToken() {
+      if (PEER_TOKEN) return PEER_TOKEN;
+      const v = window.prompt('请输入本机 Peer Link 共享 token（见 ~/.dsh/peer-link/config.json）') || '';
+      PEER_TOKEN = v.trim();
+      return PEER_TOKEN;
+    }
+
+    // 所有控制台请求统一从这里走，自动带鉴权头
+    async function apiFetch(url, options = {}) {
+      const headers = Object.assign({}, options.headers || {}, { 'x-peer-token': ensureToken() });
+      const res = await fetch(url, Object.assign({}, options, { headers }));
+      if (res.status === 401) {
+        PEER_TOKEN = '';
+        alert('鉴权失败：共享 token 不正确或已变更');
+      }
+      return res;
+    }
+
     function switchView(v) {
       document.getElementById('viewChat').style.display = v === 'chat' ? 'flex' : 'none';
       document.getElementById('viewDash').style.display = v === 'dash' ? 'block' : 'none';
@@ -890,7 +1088,7 @@ ${replyText}
 
     async function refreshAll() {
       try {
-        const res = await fetch('/api/status');
+        const res = await apiFetch('/api/status');
         const d = await res.json();
         if (!d.ok) return;
 
@@ -921,17 +1119,20 @@ ${replyText}
         </div>
       \`;
 
+      // 对端字段全部来自远端 announce 包（name/avatar/role/url），恶意邻居可以塞
+      // <img onerror> 或 ');alert(1);//，所以文本必须转义、内联事件参数必须过滤字符集。
       peers.forEach(p => {
         const isOnline = p.online;
+        const peerId = String(p.id || p.name || '');
         html += \`
-          <div class="peer-item \${currentPeer === p.name ? 'active' : ''}" onclick="selectPeer('\${p.name}')">
-            <div class="avatar-wrap">\${p.avatar || '🖥'}<span class="status-dot \${isOnline ? 'dot-online' : 'dot-offline'}"></span></div>
+          <div class="peer-item \${currentPeer === p.name ? 'active' : ''}" data-peer="\${escapeHtml(peerId)}" onclick="selectPeer(this.dataset.peer)">
+            <div class="avatar-wrap">\${escapeHtml(p.avatar || '🖥')}<span class="status-dot \${isOnline ? 'dot-online' : 'dot-offline'}"></span></div>
             <div class="peer-info">
               <div class="peer-top-row">
-                <span class="peer-name">\${p.name}</span>
-                <span style="font-size:10px; color:\${isOnline ? '#3fb950' : '#8b949e'}">\${isOnline ? (p.latencyMs ? p.latencyMs + 'ms' : '在线') : '离线'}</span>
+                <span class="peer-name">\${escapeHtml(p.name)}</span>
+                <span style="font-size:10px; color:\${isOnline ? '#3fb950' : '#8b949e'}">\${isOnline ? (p.latencyMs ? escapeHtml(p.latencyMs) + 'ms' : '在线') : '离线'}</span>
               </div>
-              <div class="peer-desc">\${p.role || '对等端'} · \${p.url}</div>
+              <div class="peer-desc">\${escapeHtml(p.role || '对等端')} · \${escapeHtml(p.url)}</div>
             </div>
           </div>
         \`;
@@ -939,14 +1140,18 @@ ${replyText}
       listEl.innerHTML = html;
     }
 
-    function selectPeer(peerName) {
+    function selectPeer(peerKey) {
+      // 优先按 id 命中，退回 name（老数据里可能只有 name）
+      const matched = peers.find(x => String(x.id || '') === peerKey) || peers.find(x => x.name === peerKey);
+      const peerName = matched ? matched.name : peerKey;
       currentPeer = peerName;
-      if (peerName === 'all') {
+      if (peerKey === 'all') {
+        currentPeer = 'all';
         document.getElementById('currentPeerAvatar').innerText = '📡';
         document.getElementById('currentPeerName').innerText = '局域网全网集群 (All Peers)';
         document.getElementById('currentPeerSub').innerText = '广播给局域网中所有在线的 DSH 节点';
       } else {
-        const p = peers.find(x => x.name === peerName) || {};
+        const p = matched || {};
         document.getElementById('currentPeerAvatar').innerText = p.avatar || '🖥';
         document.getElementById('currentPeerName').innerText = p.name;
         document.getElementById('currentPeerSub').innerText = (p.role || '协作者') + ' · ' + (p.url || '');
@@ -961,7 +1166,7 @@ ${replyText}
     async function renderChatMessages(forceScroll = false) {
       try {
         const url = '/api/chat/messages' + (currentPeer !== 'all' ? '?peer=' + encodeURIComponent(currentPeer) : '');
-        const res = await fetch(url);
+        const res = await apiFetch(url);
         const data = await res.json();
         const msgs = data.messages || [];
 
@@ -995,14 +1200,14 @@ ${replyText}
               <div class="msg-avatar">\${isOut ? (myNode.avatar || '🧠') : '🖥'}</div>
               <div class="msg-body-wrap">
                 <div class="msg-meta">
-                  <span style="font-weight:600; color:#c9d1d9;">\${m.from}</span>
+                  <span style="font-weight:600; color:#c9d1d9;">\${escapeHtml(m.from)}</span>
                   <span class="badge-tag \${isHuman ? 'badge-human' : 'badge-agent'}">\${isHuman ? '👤 人类' : '🤖 Agent'}</span>
                   <span>\${new Date(m.time).toLocaleTimeString()}</span>
                 </div>
                 <div class="bubble">
-                  \${m.topic ? '<div class="bubble-topic">📌 ' + m.topic + '</div>' : ''}
-                  <div>\${escapeHtml(m.content)}</div>
-                  \${m.context ? '<div class="code-block">' + escapeHtml(m.context) + '</div>' : ''}
+                  \${m.topic ? '<div class="bubble-topic">📌 ' + escapeHtml(m.topic) + '</div>' : ''}
+                  <div>\${escapeMultiline(m.content)}</div>
+                  \${m.context ? '<div class="code-block">' + escapeMultiline(m.context) + '</div>' : ''}
                 </div>
               </div>
             </div>
@@ -1035,9 +1240,21 @@ ${replyText}
       m.focus();
     }
 
+    // 统一转义：远端字段（announce 包里的 name/avatar/role/url）以及落盘的 ledger 行
+    // 都不可信。必须同时转义引号，否则放进 onclick="selectPeer('...')" 里仍可逃逸。
     function escapeHtml(str) {
-      if (!str) return '';
-      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\n/g, '<br>');
+      if (str == null) return '';
+      return String(str).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+    // 多行文本（聊天正文）额外把换行转成 <br>
+    function escapeMultiline(str) {
+      return escapeHtml(str).replace(/\n/g, '<br>');
+    }
+    // 仅允许安全字符进入内联事件参数，避免属性截断逃逸
+    function escCookie(v) {
+      return String(v == null ? '' : v).replace(/[^A-Za-z0-9_.:\-\/@]/g, '');
     }
 
     async function sendMessage() {
@@ -1047,7 +1264,7 @@ ${replyText}
 
       try {
         // 走物理通道：/api/human/send（强制标记为人类指令，无法伪造）
-        const res = await fetch('/api/human/send', {
+        const res = await apiFetch('/api/human/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1068,7 +1285,7 @@ ${replyText}
 
     async function pingCurrent() {
       if (currentPeer === 'all') return alert('广播目标无需探测单个连通性');
-      const res = await fetch('/api/ping', {
+      const res = await apiFetch('/api/ping', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ peerId: currentPeer })
@@ -1083,14 +1300,17 @@ ${replyText}
       document.getElementById('dash_avatar').value = myNode.avatar || '🧠';
       document.getElementById('dash_role').value = myNode.role || '';
 
-      const res = await fetch('/api/status');
+      const res = await apiFetch('/api/status');
       const d = await res.json();
       const ledger = d.recentLedger || [];
-      document.getElementById('dashLedgerEl').innerHTML = ledger.map(l => JSON.stringify(l)).join('<br><br>');
+      // ledger 行由对端可控字段拼成（peer/topic/trace_id），JSON.stringify 不转义 <，
+      // 旧版直接进 innerHTML 等于把远端数据当 HTML 解析。
+      document.getElementById('dashLedgerEl').innerHTML =
+        ledger.map(l => '<pre style="white-space:pre-wrap; margin:0;">' + escapeHtml(JSON.stringify(l)) + '</pre>').join('');
     }
 
     async function saveDashProfile() {
-      await fetch('/api/profile', {
+      await apiFetch('/api/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1117,6 +1337,13 @@ ${replyText}
 </html>`);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 DSH 对等协同即时通讯中心已成功启动: http://127.0.0.1:${PORT}`);
+// 默认只绑回环。旧版无条件 0.0.0.0，配合 ACAO:* 和无鉴权 /api/*，
+// 同网段任意机器直接浏览器打开就能以人类身份发信、读流水、改 token。
+// 需要局域网访问时显式 PEER_LINK_BIND=0.0.0.0 —— 此时鉴权靠共享 token。
+server.listen(PORT, BIND, () => {
+  const shown = BIND === '0.0.0.0' || BIND === '::' ? '127.0.0.1' : BIND;
+  console.log(`🚀 DSH 对等协同即时通讯中心已启动: http://${shown.includes(':') && !shown.startsWith('[') ? `[${shown}]` : shown}:${PORT} (bind=${BIND})`);
+  if (BIND !== '127.0.0.1' && BIND !== '::1') {
+    console.warn('[peer-link] 注意：控制台已暴露到非回环地址，所有 /api/* 仅靠共享 token 保护，请使用强 token 并避免明文 HTTP 传输。');
+  }
 });
