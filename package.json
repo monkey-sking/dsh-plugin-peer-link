@@ -14,11 +14,13 @@
   },
   "files": [
     "index.js",
+    "server.js",
     "client.js",
     "cordis.patch.yml",
     "locale",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -39,6 +41,16 @@
     "p2p",
     "collaboration"
   ],
+  "license": "MIT",
+  "author": "monkey-sking",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monkey-sking/dsh-plugin-peer-link.git"
+  },
+  "homepage": "https://github.com/monkey-sking/dsh-plugin-peer-link#readme",
+  "bugs": {
+    "url": "https://github.com/monkey-sking/dsh-plugin-peer-link/issues"
+  },
   "scripts": {
     "test": "node --test \"test/*.test.mjs\""
   }
