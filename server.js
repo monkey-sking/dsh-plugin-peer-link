@@ -102,13 +102,18 @@ function validatePeerUrl(raw) {
 function loadConfig() {
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
-    // 旧配置里若是历史公开常量，同样轮换并落盘
+    // 旧配置里若是历史公开常量，同样轮换并落盘。
+    // 落盘不能失败就算了：token 是每次 loadConfig 现生成的，
+    // 写不进去就会每调用一次换一个值，鉴权变成随机通过。
     if (typeof cfg.token !== 'string' || cfg.token.length === 0 || LEGACY_PUBLIC_TOKENS.has(cfg.token)) {
       cfg.token = generateToken();
       try {
         fs.mkdirSync(PEER_DIR, { recursive: true });
         fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
-      } catch {}
+        console.warn('[peer-link] 检测到历史公开密钥，已轮换为随机 token 并写入 config.json；对端需同步更新');
+      } catch (err) {
+        console.warn(`[peer-link] 轮换 token 后写盘失败，本次仍会用随机 token 运行: ${err.message}`);
+      }
     }
     return cfg;
   } catch {

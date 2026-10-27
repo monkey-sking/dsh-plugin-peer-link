@@ -101,6 +101,8 @@ dsh plugin install ./dsh-plugin-peer-link-1.0.4.tgz
 > ⚠️ **不要沿用任何示例里的 token 字面量。** 首次启动会调用
 > `crypto.randomBytes(32).toString('hex')` 生成随机 token 并写入本文件；
 > 旧版本硬编码的 `dsh-peer-secret-shared-token` 在启动时会被自动识别并**轮换**。
+> 轮换只发生一次并立刻落盘（`1.1.1` 起），所以后续读配置拿到的是同一个值；
+> 轮换后**所有对端都要同步改成这个新值**，否则一律 401。
 > 查看当前值：`jq -r .token ~/.dsh/peer-link/config.json`。
 *(跨公网/远程协作时，可配合 Tailscale / ZeroTier 填入虚拟内网 IP)*
 

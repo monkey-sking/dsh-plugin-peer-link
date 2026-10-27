@@ -309,9 +309,23 @@ function loadConfig() {
         }
       });
     }
-    // 旧配置里若是历史硬编码密钥，直接轮换成随机密钥并落盘，不再对外宣称一个公开值
+    // 旧配置里若是历史硬编码密钥，直接轮换成随机密钥并落盘，不再对外宣称一个公开值。
+    //
+    // 落盘这一步是必须的，不是保险：`defaultConf.token` 是每次 loadConfig() 现生成的。
+    // 只改内存不写盘的话，控制面（每次 /api/status 都 `cfg = loadConfig()`）、UDP 雷达、
+    // 出站请求会各自拿到一个**不同的**随机 token —— 表现为鉴权时好时坏、
+    // 对端永远配不上，而且磁盘上那个公开旧值一直留着。
     if (typeof parsed.token !== 'string' || parsed.token.length === 0 || LEGACY_PUBLIC_TOKENS.has(parsed.token)) {
       parsed.token = defaultConf.token;
+      try {
+        writeFileAtomic(CONFIG_FILE, JSON.stringify(parsed, null, 2));
+        console.warn(
+          '[peer-link] 检测到历史公开密钥（本仓库是 public 仓库，该常量等于公开密钥），' +
+            '已轮换为随机 token 并写入 config.json。所有对端必须同步更新成同一个 token，否则会 401。'
+        );
+      } catch (err) {
+        console.warn(`[peer-link] 轮换 token 后写盘失败，本次仍会用随机 token 运行: ${err.message}`);
+      }
     }
     return { ...defaultConf, ...parsed, node: { ...defaultConf.node, ...(parsed.node || {}) } };
   } catch {
