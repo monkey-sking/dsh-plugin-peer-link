@@ -11,6 +11,22 @@ const CONFIG_FILE = path.join(PEER_DIR, 'config.json');
 const LEDGER_FILE = path.join(PEER_DIR, 'ledger.jsonl');
 const SERVERS_FILE = path.join(PEER_DIR, 'servers.json');
 
+// 本机局域网地址。之前这里是硬编码的开发机内网 IP，
+// 换台机器就会把对端回连到别人的内网 IP 上，既不通也泄露开发机网段。
+// 优先取非回环 IPv4；拿不到时退回 127.0.0.1，让对端按回环处理而不是乱指。
+function getLocalLanAddress() {
+  try {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name] || []) {
+        const isV4 = iface.family === 'IPv4' || iface.family === 4;
+        if (isV4 && !iface.internal) return iface.address;
+      }
+    }
+  } catch {}
+  return '127.0.0.1';
+}
+
 function loadServers() {
   if (!fs.existsSync(SERVERS_FILE)) return [];
   try {
@@ -331,7 +347,7 @@ const server = http.createServer((req, res) => {
                 avatar: myNode.avatar || '🧠',
                 role: myNode.role || '协作者',
                 type: asHuman ? 'human' : 'agent',
-                url: `http://192.168.31.124:${cfg.listen_port || 8765}`
+                url: `http://${getLocalLanAddress()}:${cfg.listen_port || 8765}`
               }
             };
             const r = await fetch(postUrl, {
