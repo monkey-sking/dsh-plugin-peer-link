@@ -307,57 +307,41 @@ window.__ModuleLoader__.load({
       document.head.appendChild(style);
     }
 
-    // API 客户端请求封装
-    // 端口探测必须带身份校验：8765-8770 上可能跑着本机其他无关服务，
-    // 只要回 200 就采信会把别人的接口当成 Peer Link 读写。
-    let cachedPort = null;
-    const CANDIDATE_PORTS = [8765, 8766, 8767, 8768, 8769, 8770];
-
-    async function probePeerLinkPort(port) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/health`, { method: "GET" });
-        if (!res.ok) return false;
-        const d = await res.json();
-        // 必须同时命中本插件的探针契约
-        return d && d.status === "ok" && d.node && typeof d.port === "number";
-      } catch {
-        return false;
-      }
-    }
-
-    async function resolvePort() {
-      if (cachedPort && (await probePeerLinkPort(cachedPort))) return cachedPort;
-      cachedPort = null;
-      for (const p of CANDIDATE_PORTS) {
-        if (await probePeerLinkPort(p)) {
-          cachedPort = p;
-          return p;
-        }
-      }
-      throw new Error("无法连接本地 Peer 服务，请确认插件已启动。");
-    }
+    // 宿主同源 RPC 通道。
+    //
+    // 面板以前直接跨源 fetch `127.0.0.1:8765-8770/api/*`。控制面现在要求
+    // x-peer-token，而**凭据不能下发到浏览器**，所以改走宿主 Connection 注册的
+    // 同源路由（见 index.js 的 handlePanelRpc）：Host/Origin 围栏和会话鉴权由宿主
+    // 代做，真实 token 由宿主在服务端使用，浏览器这一侧一个凭据都不持有。
+    //
+    // 附带好处：不再需要在 8765-8770 之间探端口——以前那段探测本身就有把本机
+    // 其他服务误认成 Peer Link 的风险。路由路径是固定的，插件没加载就是 404。
+    const RPC_ROUTE = "api/peer-link.rpc";
 
     async function apiRequest(endpoint, method = "GET", data = null) {
-      const port = await resolvePort();
-      const url = `http://127.0.0.1:${port}${endpoint}`;
-      const options = {
-        method,
-        headers: { "Content-Type": "application/json" },
-      };
-      if (data) options.body = JSON.stringify(data);
-      const res = await fetch(url, options);
-      if (res.status === 401 || res.status === 403) {
-        throw new Error("本地 Peer 服务拒绝了该请求（鉴权失败）");
+      let res;
+      try {
+        res = await fetch(RPC_ROUTE, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint, method, data }),
+        });
+      } catch {
+        throw new Error("无法连接宿主服务，请确认 Peer Link 插件已加载。");
       }
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try {
-          const d = await res.json();
-          if (d && d.error) msg = d.error;
-        } catch {}
+      if (res.status === 404) {
+        throw new Error("Peer Link 的宿主路由未注册（插件可能未启动）。");
+      }
+      const payload = await res.json().catch(() => null);
+      if (!res.ok || !payload || payload.ok !== true) {
+        const msg =
+          payload && typeof payload.error === "string"
+            ? payload.error
+            : `宿主返回 HTTP ${res.status}`;
         throw new Error(msg);
       }
-      return await res.json();
+      return payload.data;
     }
 
     // 侧边栏图标组件

@@ -5,6 +5,8 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 
+import { PANEL_RPC_ROUTE, PanelRpcError, normalizeCall } from './lib/panel-rpc.js';
+
 export const name = 'dsh-plugin-peer-link';
 export const inject = ['tools', 'systemPrompt'];
 
@@ -1866,6 +1868,113 @@ export function apply(ctx) {
     },
   });
   radar.start();
+
+  // ── 侧栏面板的同源 RPC 桥 ──────────────────────────────────────────────
+  // client.js 是跑在 DSH 页面里的浏览器代码。控制面现在要求 x-peer-token，
+  // 而凭据不该下发到浏览器，所以面板不能（也不该）再跨源直连 127.0.0.1:8765。
+  // 这里在宿主 Connection 上注册一条同源路由，由宿主做 Host/Origin 围栏与会话
+  // 鉴权；本函数在服务端用真实 token 走回环调自己的控制面。
+  // 净效果：面板可用，token 一次都没有离开宿主进程。
+  function panelJson(body, status = 200) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
+  }
+
+  async function callControlPlane(target, method, body) {
+    if (!Number.isInteger(activePort)) {
+      throw new Error('本地 Peer 服务尚未就绪，请稍后重试');
+    }
+    if (!cfg.token) {
+      // 控制面在无 token 时是锁死的（见 authorizeControlPlane），这里给出可操作的提示，
+      // 而不是让用户看到一个无信息的 401。
+      throw new Error('本机未配置共享 token，控制面已锁定：请先在插件设置里填入 token');
+    }
+    const headers = { 'x-peer-token': String(cfg.token) };
+    const init = { method, headers };
+    if (method !== 'GET' && body !== null && body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    const res = await fetch(`http://127.0.0.1:${activePort}${target}`, init);
+    const text = await res.text();
+    if (!res.ok) {
+      let message = `控制面返回 HTTP ${res.status}`;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && parsed.error) message = parsed.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return text;
+  }
+
+  async function handlePanelRpc(request) {
+    let payload;
+    try {
+      payload = await request.json();
+    } catch {
+      return panelJson({ ok: false, error: '请求体必须是 JSON' }, 400);
+    }
+
+    let call;
+    try {
+      call = normalizeCall(payload);
+    } catch (err) {
+      if (err instanceof PanelRpcError) {
+        return panelJson({ ok: false, error: err.message }, err.status);
+      }
+      throw err;
+    }
+
+    try {
+      const text = await callControlPlane(call.path, call.method, call.body);
+      // /api/status 这类回 JSON，/api/session 回 Markdown 原文，两种都要能过。
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
+      return panelJson({ ok: true, data });
+    } catch (err) {
+      return panelJson({ ok: false, error: err.message }, 502);
+    }
+  }
+
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['connection'], (connectionCtx) => {
+      const registry =
+        (typeof connectionCtx.get === 'function' ? connectionCtx.get('connection') : undefined)?.fetch ??
+        connectionCtx.connection?.fetch;
+      if (!registry || typeof registry.register !== 'function') {
+        console.warn('[peer-link] 未拿到 connection.fetch，侧栏面板的 RPC 桥未注册');
+        return;
+      }
+      connectionCtx.effect(() => {
+        const dispose = registry.register({
+          path: PANEL_RPC_ROUTE,
+          methods: ['POST'],
+          requestBody: 'buffered',
+          fetch: handlePanelRpc,
+        });
+        return () => {
+          try {
+            void Promise.resolve(dispose()).catch(() => {});
+          } catch {
+            /* 已经释放 */
+          }
+        };
+      }, 'peer-link: /api/peer-link.rpc');
+    });
+  } else {
+    console.warn('[peer-link] ctx.inject 不可用，侧栏面板的 RPC 桥未注册');
+  }
 
   // 2. 注入系统 Prompt 提示词
   if (typeof ctx.systemPrompt?.context === 'function') {
