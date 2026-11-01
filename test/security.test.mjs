@@ -187,6 +187,44 @@ test('/api/session-token 用共享 token 换控制面凭据，且不回显 token
   assert.equal(cross.status, 403);
 });
 
+test('/api/session-token 只凭 body 里的共享 token 即可换凭据（不要求 x-peer-token 头，修复页面死锁）', async () => {
+  const origin = 'http://127.0.0.1:52800';
+  // 这正是仪表盘首次加载的真实场景：此时浏览器还没有任何 x-peer-token。
+  const ok = await request('/api/session-token', {
+    method: 'POST', headers: { Origin: origin }, body: { token: TOKEN },
+  });
+  assert.equal(ok.status, 200, 'body 中 token 正确时必须直接换到凭据，不得因缺少 x-peer-token 头返回 401');
+  assert.ok(typeof ok.json.credential === 'string' && ok.json.credential.length >= 32);
+
+  // 换到的凭据能正常访问控制面
+  const status = await request('/api/status', {
+    headers: { 'x-peer-token': ok.json.credential, Origin: origin },
+  });
+  assert.equal(status.status, 200);
+
+  // 关键回归：同源 GET 请求浏览器不带 Origin 头，派生凭据仍必须被接受（否则只读接口全 401、页面永久"加载中"）
+  const statusNoOrigin = await request('/api/status', {
+    headers: { 'x-peer-token': ok.json.credential },
+  });
+  assert.equal(statusNoOrigin.status, 200, '派生凭据在无 Origin 头的同源请求下也必须可用');
+  const sessionsNoOrigin = await request('/api/sessions', {
+    headers: { 'x-peer-token': ok.json.credential },
+  });
+  assert.equal(sessionsNoOrigin.status, 200, '派生凭据访问 /api/sessions 也必须可用');
+
+  // token 错误仍然 401
+  const wrong = await request('/api/session-token', {
+    method: 'POST', headers: { Origin: origin }, body: { token: 'not-the-token' },
+  });
+  assert.equal(wrong.status, 401);
+
+  // 无 body / 空 token 也不放行
+  const empty = await request('/api/session-token', {
+    method: 'POST', headers: { Origin: origin }, body: {},
+  });
+  assert.equal(empty.status, 401);
+});
+
 test('仪表盘前端所有控制面 fetch 都带鉴权头（A2 回归）', async () => {
   const res = await request('/', { headers: auth });
   assert.equal(res.status, 200);
@@ -342,6 +380,22 @@ test('雷达丢弃 token 不一致的探测包', async () => {
   );
 });
 
+test('仪表盘下发的内联脚本必须语法有效（防止模板字符串转义把正则写坏导致页面永久"加载中"）', async () => {
+  const res = await request('/', { headers: auth });
+  assert.equal(res.status, 200);
+  const scripts = [...res.body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  assert.ok(scripts.length >= 1, '仪表盘应至少包含一个内联脚本块');
+  scripts.forEach((code, i) => {
+    // 用 Function 编译即可验证语法（不执行）
+    assert.doesNotThrow(() => new Function(code), `第 ${i} 个内联脚本块存在语法错误`);
+  });
+  // 曾经的具体回归：escAttr 正则 /[^...:\-\/]/ 在模板字符串里被吃掉反斜杠，变成 :-/ 区间导致 SyntaxError
+  assert.ok(
+    !res.body.includes(':-/]/g'),
+    'escAttr 正则不得退化成 :-/ 非法区间（模板字符串转义陷阱）'
+  );
+});
+
 test('仪表盘对所有远端字段做 HTML 转义', async () => {
   const res = await request('/', { headers: auth });
   assert.equal(res.status, 200);
@@ -349,12 +403,22 @@ test('仪表盘对所有远端字段做 HTML 转义', async () => {
   for (const field of ['esc(p.name)', 'esc(p.role', 'esc(p.avatar', 'esc(item.peer', 'esc(item.topic']) {
     assert.ok(res.body.includes(field), `仪表盘应转义 ${field}`);
   }
-  // textContent 赋值天然免疫注入（第 799 行），不属于需要转义的 innerHTML 路径；
-  // 这里确保 innerHTML 模板里没有裸插值。
-  const innerHtmlBlocks = res.body.split('innerHTML').slice(1).join('innerHTML');
+  // 只检查真正写入 innerHTML 的语句：从 'innerHTML =' 起到语句结束（模板字符串闭合）。
+  // textContent 赋值（如 <option>.textContent）天然免疫注入，不属于 innerHTML 路径。
+  const innerHtmlStmts = [];
+  const src = res.body;
+  const re = /\.innerHTML\s*=\s*[`']/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    // 取到下一个 ; 之前（模板字符串里不含裸分号作为语句结束的场景在此页面可控）
+    const start = m.index;
+    const semi = src.indexOf(';', start);
+    innerHtmlStmts.push(src.slice(start, semi === -1 ? src.length : semi));
+  }
+  const innerHtmlText = innerHtmlStmts.join('\n----\n');
   for (const bare of ['${p.name}', '${p.role', '${p.url}']) {
     assert.ok(
-      !innerHtmlBlocks.includes(bare),
+      !innerHtmlText.includes(bare),
       `innerHTML 路径不应存在裸插值 ${bare}`
     );
   }

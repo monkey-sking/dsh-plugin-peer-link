@@ -1135,26 +1135,84 @@ export function apply(ctx) {
     // 而页面本身是 / 这一裸路由，任何能打开 127.0.0.1:<port>/ 的进程都能读到）。
     // 改为页面首次加载时用共享 token 换取会话凭据，只存在 JS 内存里，不落 cookie/localStorage。
     let CONTROL_CRED = '';
+    let CRED_PENDING = null;
 
-    async function ensureCred() {
-      if (CONTROL_CRED) return CONTROL_CRED;
-      let token = '';
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        token = prompt('请输入本机 Peer Link 共享 token（见 ~/.dsh/peer-link/config.json）') || '';
-        if (!token) throw new Error('未提供共享 token，控制面已锁定');
+    // 用共享 token 换取控制面凭据；成功返回 credential，失败返回 ''。
+    async function exchangeToken(token) {
+      try {
         const res = await fetch('/api/session-token', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token })
         });
-        if (res.ok) {
-          const d = await res.json();
-          CONTROL_CRED = d.credential || '';
-          if (CONTROL_CRED) return CONTROL_CRED;
-        }
-        alert('token 不正确，请重试');
+        if (!res.ok) return '';
+        const d = await res.json();
+        return d.credential || '';
+      } catch (e) {
+        return '';
       }
-      throw new Error('鉴权失败');
+    }
+
+    // 页面内 token 输入弹窗（替代可能被浏览器/内嵌页禁用的 window.prompt）。
+    // resolve 返回用户输入的 token（字符串），取消返回 ''。
+    function askTokenModal(hint) {
+      return new Promise((resolve) => {
+        const old = document.getElementById('tokenGate');
+        if (old) old.remove();
+        const wrap = document.createElement('div');
+        wrap.id = 'tokenGate';
+        wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#1e2330;color:#e7ecf5;border-radius:12px;padding:22px 24px;max-width:420px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,.5);font-family:inherit;';
+        box.innerHTML = '<div style="font-size:16px;font-weight:600;margin-bottom:8px;">🔐 需要本机 Peer Link 共享 token</div>'
+          + '<div style="font-size:12.5px;color:#9aa7bd;line-height:1.6;margin-bottom:12px;">' + (hint || '')
+          + '<br>token 可在 <code style="background:#0d1117;padding:1px 5px;border-radius:4px;">~/.dsh/peer-link/config.json</code> 的 <code style="background:#0d1117;padding:1px 5px;border-radius:4px;">token</code> 字段找到。</div>';
+        const input = document.createElement('input');
+        input.type = 'password';
+        input.placeholder = '粘贴共享 token';
+        input.style.cssText = 'width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #3a4459;background:#0d1117;color:#e7ecf5;font-size:14px;outline:none;';
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;margin-top:14px;';
+        const cancel = document.createElement('button');
+        cancel.textContent = '取消';
+        cancel.style.cssText = 'padding:8px 16px;border-radius:8px;border:1px solid #3a4459;background:transparent;color:#9aa7bd;cursor:pointer;font-size:13px;';
+        const ok = document.createElement('button');
+        ok.textContent = '解锁';
+        ok.style.cssText = 'padding:8px 18px;border-radius:8px;border:none;background:#3b82f6;color:#fff;cursor:pointer;font-size:13px;font-weight:600;';
+        const errLine = document.createElement('div');
+        errLine.style.cssText = 'color:#f87171;font-size:12px;margin-top:8px;min-height:16px;';
+        btnRow.appendChild(cancel); btnRow.appendChild(ok);
+        box.appendChild(input); box.appendChild(errLine); box.appendChild(btnRow);
+        wrap.appendChild(box);
+        document.body.appendChild(wrap);
+        setTimeout(() => input.focus(), 30);
+        let done = false;
+        const finish = (val) => { if (done) return; done = true; wrap.remove(); resolve(val); };
+        cancel.onclick = () => finish('');
+        ok.onclick = () => finish(input.value.trim());
+        input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); finish(input.value.trim()); } };
+      });
+    }
+
+    async function ensureCred() {
+      if (CONTROL_CRED) return CONTROL_CRED;
+      if (CRED_PENDING) return CRED_PENDING;
+      CRED_PENDING = (async () => {
+        let attempts = 0;
+        while (attempts < 3) {
+          attempts += 1;
+          const token = await askTokenModal(attempts > 1 ? '⚠️ 上次输入的 token 不正确，请重试。' : '');
+          if (!token) throw new Error('未提供共享 token，控制面已锁定');
+          const cred = await exchangeToken(token);
+          if (cred) { CONTROL_CRED = cred; return cred; }
+        }
+        throw new Error('鉴权失败：token 不正确');
+      })();
+      try {
+        return await CRED_PENDING;
+      } finally {
+        CRED_PENDING = null;
+      }
     }
 
     // 所有控制面请求统一走这里，自动带 x-peer-token
@@ -1174,7 +1232,7 @@ export function apply(ctx) {
     }
     // 仅允许安全字符进入内联事件参数，避免属性截断逃逸
     function escAttr(v) {
-      return String(v == null ? '' : v).replace(/[^A-Za-z0-9_.:\-\/]/g, '');
+      return String(v == null ? '' : v).replace(/[^A-Za-z0-9_.:\\-\\/]/g, '');
     }
 
     async function loadData() {
@@ -1492,9 +1550,12 @@ export function apply(ctx) {
       res.end(JSON.stringify({ ok: false, error: '本机未配置共享 token，控制面已锁定' }));
       return false;
     }
-    // 恒定时间比较：共享 token，或（仅限浏览器同源/回环页面）控制面派生凭据
+    // 恒定时间比较：共享 token，或控制面派生凭据。
+    // 派生凭据本身就是“已用共享 token 换过凭据”的证明，只存在于本机仪表盘页面的 JS 内存里，
+    // 且本函数已强制 isLoopbackRequest；这里不再额外要求 Origin —— 同源 GET 请求浏览器
+    // 根本不会带 Origin 头，若强行要求会导致仪表盘所有只读接口 401、页面永久“加载中”。
     const byShared = safeEqual(provided, expected);
-    const byDerived = Boolean(origin) && safeEqual(provided, getControlCredential());
+    const byDerived = safeEqual(provided, getControlCredential());
     if (!byShared && !byDerived) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'x-peer-token 不正确' }));
@@ -1546,9 +1607,34 @@ export function apply(ctx) {
       // 这是唯一接受共享 token 的浏览器入口，所以只做一件事：鉴权通过就发一个派生凭据。
       // 返回的是用 token 派生的 HMAC 值，拿不到 token 明文，也拿不到 /talk 的入站资格。
       if (req.method === 'POST' && reqUrl.pathname === '/api/session-token') {
-        if (!authorizeControlPlane(req, res, reqUrl)) return;
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, credential: getControlCredential() }));
+        if (!isLoopbackRequest(req)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '控制面接口仅允许本机访问' }));
+          return;
+        }
+        const origin = req.headers.origin;
+        if (origin && !isAllowedOrigin(origin) && !isSameOriginAsRequest(req, origin)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '跨源访问被拒绝' }));
+          return;
+        }
+        readBody(req, res, (raw) => {
+          try {
+            const data = JSON.parse(raw);
+            const provided = String(data?.token || '');
+            const expected = String(cfg.token || '');
+            if (!expected || !provided || !safeEqual(provided, expected)) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: '共享 token 不正确' }));
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ ok: true, credential: getControlCredential() }));
+          } catch (err) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: '无效请求体' }));
+          }
+        });
         return;
       }
 
