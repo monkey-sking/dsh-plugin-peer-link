@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -458,4 +458,38 @@ test('PeerDispatcher: /talk 支持系统环境指标动态查询', async () => {
   assert.ok(res.json.reply.includes('系统环境指标'));
   assert.equal(res.json.payload?.kind, 'system');
   assert.ok(res.json.payload.items[0].nodeVersion.startsWith('v'));
+});
+
+// ── 控制面绑定开关：config.json 的 allow_public_plane ──
+// 桌面 GUI 由 launchd/watchdog 拉起时环境变量常继承不到，故必须支持配置文件持久开关。
+// 这里直接对独立进程内的实现做单元验证：构造临时 config.json，观察 isControlPlanePublic 结果。
+// CONFIG_FILE 在模块加载时按当时的 DSH_HOME 固定，同一进程内改 env 无效，
+// 故用子进程在独立 DSH_HOME 下分别验证三种配置。
+function runBindCheck(cfgJson, extraEnv = {}) {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'peer-link-bind-'));
+  fs.mkdirSync(path.join(tmpHome, 'peer-link'), { recursive: true });
+  if (cfgJson !== null) {
+    fs.writeFileSync(path.join(tmpHome, 'peer-link', 'config.json'), JSON.stringify(cfgJson));
+  }
+  const script =
+    "import('./index.js').then(m => { process.stdout.write(m.isControlPlanePublic() ? 'OPEN' : 'LOOP'); });";
+
+  const env = { ...process.env, DSH_HOME: tmpHome, ...extraEnv };
+  delete env.DSH_PEER_ALLOW_PUBLIC;
+  Object.assign(env, extraEnv);
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: path.join(import.meta.dirname, '..'),
+    env,
+    encoding: 'utf8',
+  });
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+  return (r.stdout || '').trim();
+}
+
+test('isControlPlanePublic: 配置文件开关 allow_public_plane', () => {
+  const base = { node: { id: 'x' }, listen_port: 8765, token: 't', peers: [] };
+  assert.equal(runBindCheck(base), 'LOOP', '未设置 allow_public_plane 时应绑定回环（安全默认）');
+  assert.equal(runBindCheck({ ...base, allow_public_plane: true }), 'OPEN', 'allow_public_plane:true 时应开放 0.0.0.0');
+  assert.equal(runBindCheck({ ...base, allow_public_plane: false }), 'LOOP', 'allow_public_plane:false 仍回环');
+  assert.equal(runBindCheck(base, { DSH_PEER_ALLOW_PUBLIC: '1' }), 'OPEN', 'DSH_PEER_ALLOW_PUBLIC=1 兼容生效');
 });

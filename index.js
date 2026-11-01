@@ -94,9 +94,22 @@ function isLoopbackRequest(req) {
 // 控制面默认只监听回环。需要局域网访问时必须显式开启，
 // 且知道共享 token 的任意一个邻居就能读写整个控制面。
 // 旧版无条件 listen('0.0.0.0')，配合“同源即免 token”等于把控制面裸奔在局域网。
-function isControlPlanePublic() {
+//
+// 开关来源（任一为真即开）：
+//   1) config.json 里的 allow_public_plane: true —— 持久、每机可配，
+//      桌面 GUI 由 launchd/watchdog 拉起时环境变量往往继承不到，故优先支持配置文件。
+//   2) 环境变量 DSH_PEER_ALLOW_PUBLIC=1/true/yes —— 兼容容器/脚本场景。
+// 默认（两者都没设）仍为回环，保持安全默认。
+export function isControlPlanePublic() {
   const v = String(process.env.DSH_PEER_ALLOW_PUBLIC || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  if (v === '1' || v === 'true' || v === 'yes') return true;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+    if (parsed && (parsed.allow_public_plane === true || parsed.allow_public_plane === 1)) return true;
+  } catch {
+    // 读不到 / 解析失败时按默认（回环）处理
+  }
+  return false;
 }
 
 // 生成高强度共享密钥。绝不允许回退到硬编码常量（public 仓库 = 公开密钥）
@@ -250,6 +263,10 @@ function loadConfig() {
       role: '全栈架构 · 移动端/UI',
     },
     listen_port: parseInt(process.env.DSH_PEER_PORT || '8765', 10),
+    // 控制面绑定开关：默认 false（只绑 127.0.0.1，安全默认）。
+    // 需要跨机 peer_talk 时设为 true，会把控制面绑到 0.0.0.0 ——
+    // 此时局域网内知道共享 token 的任意节点都可读写控制面，请自行评估风险。
+    allow_public_plane: false,
     // 雷达 UDP 端口。同一台机器同时跑多个实例时必须各用一个，
     // 因为 reuseAddr 会让同端口的多个 socket 互相争抢数据包。
     radar_port: parseInt(process.env.DSH_PEER_RADAR_PORT || '8764', 10),

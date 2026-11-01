@@ -118,7 +118,7 @@ dsh plugin install ./dsh-plugin-peer-link-1.0.4.tgz
 
 - 控制面接口强制校验 `Origin`：浏览器从外部网页发起的请求，`remoteAddress` 同样是 `127.0.0.1`，只靠 IP 无法防 CSRF，因此必须看来源；
 - **但 `Origin` 只证明“请求来自哪里”，不能替代“请求者是谁”**：同源页面免 token 会让任意本机网页通过 CSRF 调用 `/api/profile` 改 token、`/api/human/send` 代发消息。因此还必须有 `x-peer-token`；
-- 控制面默认只监听 `127.0.0.1`。需要局域网访问时显式设置 `PEER_LINK_BIND=0.0.0.0`（插件侧对应 `DSH_PEER_ALLOW_PUBLIC=1`），并接受“仅靠共享 token 保护”的风险；
+- 控制面默认只监听 `127.0.0.1`。需要局域网访问时显式开启，**推荐在 `~/.dsh/peer-link/config.json` 里设 `"allow_public_plane": true`**（持久、每机可配；桌面 GUI 由 launchd/watchdog 拉起时环境变量常继承不到）；容器/脚本场景也可设环境变量 `DSH_PEER_ALLOW_PUBLIC=1`。开启后接受“仅靠共享 token 保护”的风险；
 - `/api/status` **不再返回明文 token**，只返回 `tokenConfigured: boolean`；
 - 所有入站字段（节点名、角色、头像、主题）在仪表盘渲染前统一 HTML 转义，防止恶意节点注入脚本；
 - 对端 URL 在**入库前**和**出站前**各校验一次：拒绝非 `http(s)`、内嵌凭据、`0.0.0.0/8`、`169.254.0.0/16`（云元数据）、回环与链路本地地址，防 SSRF；
