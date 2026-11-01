@@ -360,6 +360,28 @@ test('仪表盘对所有远端字段做 HTML 转义', async () => {
   }
 });
 
+test('会话记录面板：UI 存在、字段转义、接口需鉴权且拒绝路径穿越', async () => {
+  const dash = await request('/', { headers: auth });
+  assert.equal(dash.status, 200);
+  // 面板 UI 三个关键片段必须下发
+  for (const frag of ['会话记录浏览器', 'id="sessionBody"', 'id="sessionModal"', 'parseSessionMeta']) {
+    assert.ok(dash.body.includes(frag), `仪表盘应包含会话面板片段 ${frag}`);
+  }
+  // 面板渲染路径必须走 esc/escAttr，不能裸插值
+  for (const must of ['esc(meta.topic', 'esc(meta.peer', 'esc(meta.status', 'escAttr(f)']) {
+    assert.ok(dash.body.includes(must), `面板应转义 ${must}`);
+  }
+  // /api/sessions 与 /api/session 必须受控制面鉴权保护
+  const noAuth = await request('/api/sessions', { headers: { 'x-peer-token': 'wrong-token' } });
+  assert.equal(noAuth.status, 401, '/api/sessions 无有效凭据应 401');
+  // 路径穿越必须被 basename 挡掉（不能读到 sessions 目录外的文件）
+  const escape = await request('/api/session?file=' + encodeURIComponent('../../config.json'), { headers: auth });
+  assert.ok([404, 200].includes(escape.status), '路径穿越应被安全处理');
+  if (escape.status === 200) {
+    assert.ok(!escape.body.includes('"token"'), '不应能通过穿越读到 config.json');
+  }
+});
+
 test('PeerDispatcher: /api/servers 支持登记与查阅服务器资产', async () => {
   // 1. 添加测试服务器
   const addRes = await request('/api/servers', {

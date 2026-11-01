@@ -1074,6 +1074,43 @@ export function apply(ctx) {
         <tbody id="ledgerBody"></tbody>
       </table>
     </div>
+
+    <!-- 会话记录浏览器 -->
+    <div class="card" style="margin-top:24px;">
+      <div class="card-title">
+        <span>💬 会话记录浏览器 (Session Archive)</span>
+        <button class="btn" style="padding:2px 8px; font-size:11px;" onclick="loadSessions()">🔄 刷新</button>
+      </div>
+      <div style="color:#8b949e; font-size:12px; margin-bottom:12px; line-height:1.6;">
+        仅显示<b>本机</b>落盘的会话：本机发起的、本机与各对端的往返、以及发送到本机的全网广播。<br>
+        其它两台电脑之间的对话不会出现在这里（各自的会话只存于各自机器）。
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:64px;">流向</th>
+            <th>主题</th>
+            <th style="width:150px;">对端</th>
+            <th style="width:70px;">状态</th>
+            <th style="width:70px;">耗时</th>
+            <th style="width:150px;">时间</th>
+            <th style="width:60px;">操作</th>
+          </tr>
+        </thead>
+        <tbody id="sessionBody"><tr><td colspan="7" style="color:#8b949e; text-align:center; padding:12px;">点击「刷新」加载会话记录</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 会话详情弹窗 -->
+  <div id="sessionModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:9999; padding:40px 20px; overflow:auto;">
+    <div style="max-width:900px; margin:0 auto; background:#161b22; border:1px solid #30363d; border-radius:12px; padding:20px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <span style="font-weight:600; color:#e6edf3;" id="sessionModalTitle">会话详情</span>
+        <button class="btn" style="padding:3px 10px;" onclick="closeSessionModal()">✕ 关闭</button>
+      </div>
+      <pre id="sessionModalBody" style="white-space:pre-wrap; word-break:break-word; color:#c9d1d9; font-size:12.5px; line-height:1.7; margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"></pre>
+    </div>
   </div>
 
   <script>
@@ -1129,6 +1166,7 @@ export function apply(ctx) {
         const data = await res.json();
         if (!data.ok) return;
 
+        window.__myNodeName = data.node.name || '';
         document.getElementById('my_name').value = data.node.name || '';
         document.getElementById('my_avatar').value = data.node.avatar || '🤖';
         document.getElementById('my_role').value = data.node.role || '';
@@ -1270,7 +1308,112 @@ export function apply(ctx) {
       loadData();
     }
 
+    // ===== 会话记录浏览器 =====
+    // 从 md 头部解析关键字段（发起方/接收方/主题/状态/耗时/方向）
+    function parseSessionMeta(md) {
+      // 逐行查找 "- **标签**: 值"，纯字符串操作，避开正则转义地狱
+      const get = (label) => {
+        const needle = label + '**';
+        const lines = md.split('\\n');
+        for (let i = 0; i < lines.length; i++) {
+          const ln = lines[i];
+          const idx = ln.indexOf(needle);
+          if (idx < 0) continue;
+          // 取 "**: " 之后的内容
+          const colon = ln.indexOf(':', idx + needle.length);
+          if (colon < 0) continue;
+          let val = ln.slice(colon + 1).trim();
+          // 去掉所有 * 符号（不依赖正则，避免模板字符串转义）
+          val = val.split('*').join('').trim();
+          if (val) return val;
+        }
+        return '';
+      };
+      const sender = get('发起方');
+      const receiver = get('接收方');
+      const topic = get('沟通主题');
+      const status = get('会话状态');
+      const dur = get('耗时');
+      const time = get('记录时间');
+      // 方向判断：发起方是否为本机（节点名匹配）
+      const me = (window.__myNodeName || '').trim();
+      let direction = '';
+      if (sender && receiver) {
+        if (me && sender.indexOf(me) >= 0) direction = 'outbound';
+        else if (me && receiver.indexOf(me) >= 0) direction = 'inbound';
+        else direction = 'outbound';
+      }
+      // 广播：任一侧/主题含"广播/全部/All"
+      const blob = sender + ' ' + receiver + ' ' + topic;
+      const isBroadcast = blob.indexOf('广播') >= 0 || blob.indexOf('全部') >= 0 || /all peers/i.test(blob);
+      const peer = direction === 'outbound' ? receiver : sender;
+      return { sender, receiver, topic, status, dur, time, direction, isBroadcast, peer };
+    }
+
+    async function loadSessions() {
+      const tbody = document.getElementById('sessionBody');
+      if (!tbody) return;
+      tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e; text-align:center; padding:12px;">加载中...</td></tr>';
+      try {
+        const res = await apiFetch('/api/sessions');
+        const data = await res.json();
+        const files = (data.sessions || []);
+        if (!files.length) {
+          tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e; text-align:center; padding:12px;">暂无会话记录</td></tr>';
+          return;
+        }
+        // 逐条拉取详情解析元信息（最多 30 条，串行）
+        const rows = [];
+        for (const f of files) {
+          let meta = { topic: '', peer: '', status: '', dur: '', time: '', direction: '', isBroadcast: false };
+          try {
+            const r2 = await apiFetch('/api/session?file=' + encodeURIComponent(f));
+            if (r2.ok) meta = parseSessionMeta(await r2.text());
+          } catch (e) {}
+          let dt = '';
+          if (meta.time) {
+            dt = meta.time.replace('T', ' ');
+            // 去掉毫秒与结尾 Z：找到 '.' 截断
+            const dot = dt.indexOf('.');
+            if (dot > 0) dt = dt.slice(0, dot);
+            if (dt.endsWith('Z')) dt = dt.slice(0, -1);
+          }
+          const arrow = meta.isBroadcast ? '📡 广播' : (meta.direction === 'outbound' ? '📤 发出' : '📥 收到');
+          const arrowCls = meta.isBroadcast ? 'badge-purple' : (meta.direction === 'outbound' ? 'badge-green' : 'badge-purple');
+          rows.push(\`<tr>
+            <td><span class="badge \${arrowCls}" style="font-size:10px;">\${arrow}</span></td>
+            <td>\${esc(meta.topic || f)}</td>
+            <td>\${esc(meta.peer)}</td>
+            <td>\${esc(meta.status)}</td>
+            <td>\${meta.dur ? esc(meta.dur) : '-'}</td>
+            <td style="font-family:monospace; color:#8b949e; font-size:11px;">\${esc(dt)}</td>
+            <td><button class="btn" style="padding:2px 8px; font-size:11px;" data-file="\${escAttr(f)}" onclick="openSession(this.dataset.file)">查看</button></td>
+          </tr>\`);
+        }
+        tbody.innerHTML = rows.join('');
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="7" style="color:#f85149; text-align:center; padding:12px;">加载失败: ' + esc(e.message) + '</td></tr>';
+      }
+    }
+
+    async function openSession(file) {
+      if (!file) return;
+      try {
+        const res = await apiFetch('/api/session?file=' + encodeURIComponent(file));
+        const text = res.ok ? await res.text() : '读取失败 (HTTP ' + res.status + ')';
+        document.getElementById('sessionModalTitle').textContent = '会话: ' + file;
+        document.getElementById('sessionModalBody').textContent = text;
+        document.getElementById('sessionModal').style.display = 'block';
+      } catch (e) { alert('打开失败: ' + e.message); }
+    }
+
+    function closeSessionModal() {
+      document.getElementById('sessionModal').style.display = 'none';
+    }
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSessionModal(); });
+
     loadData();
+    loadSessions();
     setInterval(loadData, 5000);
   </script>
 </body>
