@@ -220,3 +220,10 @@ test('E2E: 浏览器侧不再直接持有 token —— 跨源直连控制面仍�
   });
   assert.equal(res.status, 401, '跨源无凭据必须被拒（这正是面板改走 RPC 的原因）');
 });
+
+test('PANEL_RPC_ROUTE 必须以 /api/ 开头（宿主 endpointFromPath 要求，否则路由注册失败→面板永久加载中）', () => {
+  assert.ok(PANEL_RPC_ROUTE.startsWith('/api/'), `PANEL_RPC_ROUTE=${PANEL_RPC_ROUTE} 缺少 /api/ 前缀`);
+  // 每个路径段必须匹配宿主 ENDPOINT_SEGMENT_PATTERN，否则同样注册失败
+  const endpoint = PANEL_RPC_ROUTE.slice('/api/'.length);
+  assert.ok(endpoint.split('/').every((s) => /^[A-Za-z0-9_$.-]+$/.test(s)), 'endpoint 含非法字符');
+});

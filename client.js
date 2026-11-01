@@ -316,7 +316,7 @@ window.__ModuleLoader__.load({
     //
     // 附带好处：不再需要在 8765-8770 之间探端口——以前那段探测本身就有把本机
     // 其他服务误认成 Peer Link 的风险。路由路径是固定的，插件没加载就是 404。
-    const RPC_ROUTE = "api/peer-link.rpc";
+    const RPC_ROUTE = "/api/peer-link.rpc";
 
     async function apiRequest(endpoint, method = "GET", data = null) {
       let res;
