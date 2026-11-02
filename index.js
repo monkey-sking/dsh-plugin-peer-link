@@ -2689,7 +2689,7 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
     },
   });
 
-  return () => {
+  const dispose = () => {
     flushSave();
     if (radar) {
       radar.stop();
@@ -2700,4 +2700,14 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
       server = null;
     }
   };
+
+  // cordis 不使用 apply() 的返回值做清理，必须显式注册。
+  // 不注册的后果（1.1.6 及以前实测）：热重载时旧实例的 HTTP server 永不关闭，
+  // 新实例 listen 撞 EADDRINUSE 后按 startHttpServer 的回退逻辑跳到 port+1，
+  // 于是 8765/8766/8767 一层层堆僵尸实例，花名册指向最早那个已死的。
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => dispose, 'peer-link: http server & radar');
+  }
+
+  return dispose;
 }
