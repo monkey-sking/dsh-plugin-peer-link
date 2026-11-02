@@ -2643,13 +2643,23 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
 
         if (!target) return { ok: false, error: '未找到可探测的对等节点' };
         const result = await pingPeer(cfg, target);
+        // 宿主校验工具返回值必须"无损 JSON"，出现 undefined / NaN 属性会整条拒绝
+        // （报 value is not lossless JSON）。pingPeer 的成功/失败返回形状不对称：
+        // 成功 {ok, latencyMs, info}，失败 {ok, error}，所以按分支构造，字段一律落具体值。
+        if (!result.ok) {
+          return {
+            ok: false,
+            targetNode: target.name,
+            targetUrl: target.url,
+            error: result.error ?? '探测失败',
+          };
+        }
         return {
-          ok: result.ok,
+          ok: true,
           targetNode: target.name,
           targetUrl: target.url,
-          durationMs: result.latencyMs,
-          peerInfo: result.info,
-          error: result.error,
+          durationMs: Number.isFinite(result.latencyMs) ? result.latencyMs : 0,
+          peerInfo: result.info ?? {},
         };
       }
 
@@ -2679,7 +2689,7 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
     },
   });
 
-  return () => {
+  const dispose = () => {
     flushSave();
     if (radar) {
       radar.stop();
@@ -2690,4 +2700,14 @@ ${peersSummary || '• 暂无对等节点，可通过 peer_status 进行发现�
       server = null;
     }
   };
+
+  // cordis 不使用 apply() 的返回值做清理，必须显式注册。
+  // 不注册的后果（1.1.6 及以前实测）：热重载时旧实例的 HTTP server 永不关闭，
+  // 新实例 listen 撞 EADDRINUSE 后按 startHttpServer 的回退逻辑跳到 port+1，
+  // 于是 8765/8766/8767 一层层堆僵尸实例，花名册指向最早那个已死的。
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => dispose, 'peer-link: http server & radar');
+  }
+
+  return dispose;
 }
